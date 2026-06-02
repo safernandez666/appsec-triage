@@ -21,6 +21,7 @@ from pathlib import Path
 from triage.advisory_agent import AdvisoryResult, extract_vulnerable_apis
 from triage.banner import print_banner
 from triage import colors as col
+from triage.config import TierConfig, load_config
 from triage.env_loader import load_dotenv
 from triage.consistency import (
     ConsistencyAction,
@@ -137,6 +138,11 @@ class _OutputLevel(Enum):
 
 
 _LEVEL: _OutputLevel = _OutputLevel.NORMAL
+
+# Loaded once in main() from `.appsec-triage.toml` in cwd. Empty when
+# the file is absent, which means every repo falls back to the Truth
+# Table's heuristic tier classification.
+_TIER_CONFIG: TierConfig = TierConfig(by_repo={})
 
 
 def _vprint(*args: object, **kwargs: object) -> None:
@@ -567,7 +573,14 @@ def _run_pipeline_once(
             f"location={a.location_path or '—'}:{a.location_line or '—'}"
         )
 
-    tier_override = _tier_override_from_meta(a) if offline else None
+    # Tier override sources, in priority order:
+    #   1. Fixture meta hint (offline only, for deterministic test scenarios).
+    #   2. `.appsec-triage.toml` config (online — operator-declared intent).
+    #   3. Truth Table's automatic heuristic (default).
+    if offline:
+        tier_override = _tier_override_from_meta(a)
+    else:
+        tier_override = _TIER_CONFIG.lookup(repo.full_name)
     tt = preflight(a, repo, em, tier_override=tier_override)
     _vprint(_fmt_tier(tt.tier))
 
@@ -598,21 +611,18 @@ def _run_pipeline_once(
         v = judge(a, repo, em, tt.tier)
         _vprint(_fmt_judge_verdict(v))
 
-    # Scope the stage-2 LLM-attack to Dependabot. The Prosecutor prompt asks
-    # the LLM to falsify the verdict from `EvidenceMatrix`, but for
-    # code-scanning and secret-scanning the package-usage and vuln-API fields
-    # are structurally zero (no /search/code is run for those sources). A
-    # diagnostic run against a real repo showed 32/32 code-scanning alerts
-    # contradicted with the identical reason "no direct package usage hits or
-    # vulnerable API usage hits" — the LLM was reasoning about empty fields
-    # that don't apply to its source. Until we ship a code-scanning-aware
-    # Prosecutor prompt (TODO v0.2.2: ask about vendored paths, generated
-    # files, known-FP rule patterns), it is honest to skip rather than
-    # auto-degrade every code-scanning verdict to needs_review on structural
-    # grounds. Critic floor + Consistency Gate still apply.
+    # LLM-attack uses a source-aware prompt + payload:
+    #   - DEPENDABOT     → asks about package use, vuln-API hits, manifests.
+    #   - CODE_SCANNING  → asks about vendored paths, generated files,
+    #                       rule_id false-positive patterns. The previous
+    #                       single Dependabot prompt against code-scanning
+    #                       was degrading 32/32 real findings to
+    #                       needs_review on structural grounds — see
+    #                       prosecutor.PROSECUTOR_SYSTEM_PROMPT_CODE_SCANNING.
+    # Secret-scanning never reaches here (Z1 short-circuits to Z4).
     pr = prosecute(
         v, a, repo, em, tt.tier,
-        enable_llm_attack=(a.source is AlertSource.DEPENDABOT),
+        enable_llm_attack=True,
         is_recomputed=is_recomputed,
     )
     _vprint(_fmt_prosecutor(pr))
@@ -1001,13 +1011,18 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     print_banner()
     args = build_parser().parse_args(argv)
-    global _LEVEL
+    global _LEVEL, _TIER_CONFIG
     if args.verbose:
         _LEVEL = _OutputLevel.VERBOSE
     elif args.quiet:
         _LEVEL = _OutputLevel.QUIET
     else:
         _LEVEL = _OutputLevel.NORMAL
+    # Load per-repo tier overrides from .appsec-triage.toml if present.
+    # Missing file → empty config → heuristic classification (unchanged
+    # behavior). Stays a noop on offline mode (the fixture meta hint
+    # path is preferred for those).
+    _TIER_CONFIG = load_config()
     try:
         sources = _parse_sources(args.sources)
     except ValueError as e:

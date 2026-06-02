@@ -4,6 +4,8 @@ __pycache__/
 .env
 .venv/
 .triage_history.jsonl
+.triage_history.jsonl.bak.*
+.appsec-triage.toml
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

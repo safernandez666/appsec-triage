@@ -4,6 +4,18 @@ All notable changes to **appsec-triage** are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Per-repo tier overrides via `.appsec-triage.toml`.** New `triage/config.py`
+  module reads a TOML file (stdlib `tomllib`, no new runtime dep) at CLI start
+  and maps `owner/name` → tier (`critical | deployed | internal | archived`).
+  Overrides the Truth Table's heuristic tier classification — useful when the
+  repo's static structure (deploy artifacts, archived flag) doesn't reflect
+  the actual blast radius. Missing file is silent; malformed entries log to
+  stderr and are skipped. Bundled example: `.appsec-triage.example.toml`.
+
 ## [0.2.1] — 2026-06-02
 
 ### Added

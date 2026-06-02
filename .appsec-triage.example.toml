@@ -1,0 +1,40 @@
+# appsec-triage per-repo configuration (TOML).
+#
+# Copy this file to `.appsec-triage.toml` in the directory you run the
+# bot from (same place the bot reads `.env`). The file is loaded once
+# at CLI start; a missing file is silent and every repo falls back to
+# the Truth Table's heuristic tier classification.
+#
+# Today the only surface is per-repo TIER OVERRIDE. Tier drives:
+#   - The Critic's post_floor (minimum confidence to NOT degrade)
+#   - The Issue handler's transition_floor (minimum confidence to
+#     auto-dismiss when --auto-transition is on)
+#
+# Tier-1 (critical) is locked to transition_floor = ∞ in code, so a
+# critical override here is the strongest "never auto-dismiss" signal
+# you can give the bot short of editing the source.
+#
+# Accepted values (case-insensitive): critical | deployed | internal | archived
+
+[repos]
+
+# Customer-facing or otherwise high-blast-radius systems.
+# Auto-dismiss is STRUCTURALLY impossible on these regardless of
+# verdict confidence — the bot still creates Issues but never closes
+# the upstream Dependabot/CodeQL alert.
+# "org/payments-api"       = { tier = "critical" }
+# "org/customer-dashboard"  = { tier = "critical" }
+# "org/auth-service"        = { tier = "critical" }
+
+# Deployed but not directly customer-facing (internal APIs, background
+# workers). Higher confidence floor before auto-dismiss applies.
+# "org/billing-worker" = { tier = "deployed" }
+# "org/ingestion-svc"  = { tier = "deployed" }
+
+# Internal tooling, dashboards, dev infra. Default for most repos.
+# "org/dev-dashboards" = { tier = "internal" }
+
+# Archived or EOL. Lowest confidence floor — these get cleared fastest
+# because the code path isn't running anymore. Still subject to all
+# other guardrails (Truth Table rules, secret-no-dismiss, etc.).
+# "org/legacy-2018-archive" = { tier = "archived" }
