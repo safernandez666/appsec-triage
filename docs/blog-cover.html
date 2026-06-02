@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>appsec-triage — blog cover</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#e8e6e1;-webkit-font-smoothing:antialiased}
+  /* Center the cover on the page so the screenshot crop is obvious. */
+  .frame{
+    width:1600px;height:840px;
+    margin:24px auto;
+    background:#f5f5f5;
+    box-shadow:0 0 0 1px rgba(45,49,66,0.08);
+  }
+  .frame svg{display:block;width:100%;height:100%}
+  .hint{
+    max-width:1600px;margin:8px auto 24px;
+    font-family:'Geist Mono', ui-monospace, monospace;
+    font-size:11px;color:#7a8399;letter-spacing:0.08em;text-transform:uppercase;
+  }
+  /* Chrome headless mode: --window-size=1600,840 matches this query, so the
+     frame snaps to 0,0 with no hints. Lets you do `chrome --headless
+     --screenshot=cover.png --window-size=1600,840 file://...blog-cover.html`
+     and get an exact 1600x840 PNG without cropping. */
+  @media (width: 1600px) and (height: 840px) {
+    body{background:#f5f5f5}
+    .hint{display:none}
+    .frame{margin:0;box-shadow:none}
+  }
+</style>
+</head>
+<body>
+<p class="hint">Hashnode cover · 1600×840 · screenshot the white frame below</p>
+<div class="frame">
+<svg viewBox="0 0 1600 840" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="appsec-triage blog cover">
+  <defs>
+    <pattern id="dots" width="32" height="32" patternUnits="userSpaceOnUse">
+      <circle cx="1" cy="1" r="0.8" fill="rgba(45,49,66,0.10)"/>
+    </pattern>
+  </defs>
+
+  <!-- background paper -->
+  <rect width="1600" height="840" fill="#f5f5f5"/>
+  <!-- subtle editorial dot texture, only on bottom right field, not full page -->
+  <rect x="1040" y="240" width="480" height="360" fill="url(#dots)" opacity="0.45"/>
+
+  <!-- ============ HEADER ============ -->
+  <text x="80" y="76" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" letter-spacing="0.22em">BLOG POST &middot; appsec-triage</text>
+
+  <text x="80" y="148" fill="#2d3142" font-family="'Instrument Serif', 'Iowan Old Style', Times, serif"
+        font-size="56" font-weight="400">Cómo construí un bot que tría</text>
+  <text x="80" y="208" fill="#2d3142" font-family="'Instrument Serif', 'Iowan Old Style', Times, serif"
+        font-size="56" font-weight="400">tus alertas de seguridad</text>
+
+  <text x="80" y="248" fill="#7a8399" font-family="'Geist', system-ui, sans-serif"
+        font-size="18" font-weight="400">
+    (sin dejar que el LLM rompa nada) &middot; v0.2.0
+  </text>
+
+  <!-- ============ DIRECTION HINT (left margin of stack) ============ -->
+  <text x="56" y="288" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em" transform="rotate(-90 56 288)">ALERT FLOW &darr;</text>
+
+  <!-- ============ LAYER STACK ============ -->
+  <!-- outer paper card with rounded corners + ink border -->
+  <rect x="80" y="288" width="880" height="360" rx="10" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+
+  <!-- internal hairline dividers between 5 layers (72px each) -->
+  <line x1="80" y1="360" x2="960" y2="360" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+  <line x1="80" y1="432" x2="960" y2="432" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+  <line x1="80" y1="504" x2="960" y2="504" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+  <line x1="80" y1="576" x2="960" y2="576" stroke="rgba(45,49,66,0.12)" stroke-width="0.8"/>
+
+  <!-- ---- L1: INPUT (y=288..360) ---- -->
+  <text x="112" y="328" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em">L1</text>
+  <text x="184" y="320" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em">INPUT</text>
+  <text x="184" y="340" fill="#2d3142" font-family="'Geist', system-ui, sans-serif"
+        font-size="16" font-weight="600">Security alerts</text>
+  <text x="928" y="332" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" text-anchor="end">Dependabot &middot; CodeQL &middot; Secret</text>
+
+  <!-- ---- L2: PRE-LLM (y=360..432) ---- -->
+  <text x="112" y="400" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em">L2</text>
+  <text x="184" y="392" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em">PRE-LLM</text>
+  <text x="184" y="412" fill="#2d3142" font-family="'Geist', system-ui, sans-serif"
+        font-size="16" font-weight="600">Deterministic gates</text>
+  <text x="928" y="404" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" text-anchor="end">routing &middot; truth table &middot; consensus</text>
+
+  <!-- ---- L3: LLM JUDGE (CORAL FOCAL — y=432..504) ---- -->
+  <rect x="80" y="432" width="880" height="72" fill="rgba(235,108,54,0.08)"/>
+  <rect x="80" y="432" width="880" height="72" fill="transparent" stroke="#eb6c36" stroke-width="1.5"/>
+
+  <text x="112" y="472" fill="#eb6c36" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em" font-weight="600">L3</text>
+  <text x="184" y="464" fill="#eb6c36" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em" font-weight="600">LLM</text>
+  <text x="184" y="484" fill="#2d3142" font-family="'Geist', system-ui, sans-serif"
+        font-size="16" font-weight="600">Final Judge</text>
+  <text x="928" y="476" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" text-anchor="end">strict JSON &middot; temperature=0</text>
+
+  <!-- ---- L4: POST-LLM (y=504..576) ---- -->
+  <text x="112" y="544" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em">L4</text>
+  <text x="184" y="536" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em">POST-LLM</text>
+  <text x="184" y="556" fill="#2d3142" font-family="'Geist', system-ui, sans-serif"
+        font-size="16" font-weight="600">Deterministic gates</text>
+  <text x="928" y="548" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" text-anchor="end">prosecutor &middot; critic &middot; consistency</text>
+
+  <!-- ---- L5: OUTPUT (y=576..648) ---- -->
+  <text x="112" y="616" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em">L5</text>
+  <text x="184" y="608" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="9" letter-spacing="0.18em">OUTPUT</text>
+  <text x="184" y="628" fill="#2d3142" font-family="'Geist', system-ui, sans-serif"
+        font-size="16" font-weight="600">Issue + audit</text>
+  <text x="928" y="620" fill="#4f5d75" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" text-anchor="end">tier-1 guardrail enforced</text>
+
+  <!-- ============ EDITORIAL CALLOUT (right margin, coral italic serif) ============ -->
+  <!-- Dashed leader from callout to L3 right edge -->
+  <path d="M 1192 468 Q 1100 460 988 468" fill="none"
+        stroke="rgba(235,108,54,0.5)" stroke-width="1" stroke-dasharray="4,3"/>
+  <circle cx="988" cy="468" r="2.4" fill="#eb6c36"/>
+
+  <text x="1192" y="424" fill="#eb6c36"
+        font-family="'Instrument Serif', 'Iowan Old Style', Times, serif"
+        font-size="32" font-style="italic">&ldquo;the LLM is</text>
+  <text x="1192" y="464" fill="#eb6c36"
+        font-family="'Instrument Serif', 'Iowan Old Style', Times, serif"
+        font-size="32" font-style="italic">one piece &mdash;</text>
+  <text x="1192" y="504" fill="#eb6c36"
+        font-family="'Instrument Serif', 'Iowan Old Style', Times, serif"
+        font-size="32" font-style="italic">not the system.&rdquo;</text>
+
+  <text x="1192" y="544" fill="#7a8399" font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="10" letter-spacing="0.14em">&mdash; from the post</text>
+
+  <!-- ============ FOOTER COLOPHON ============ -->
+  <line x1="80" y1="752" x2="1520" y2="752" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+
+  <text x="80" y="780" fill="#4f5d75"
+        font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" letter-spacing="0.12em">v0.2.0 &middot; Python 3.11 &middot; httpx &middot; GitHub-native</text>
+
+  <text x="1520" y="780" fill="#4f5d75"
+        font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="11" letter-spacing="0.12em" text-anchor="end">github.com/safernandez666/appsec-triage</text>
+</svg>
+</div>
+<p class="hint">Open this file in browser → screenshot the white frame (use macOS ⌘⇧4 then space-click the frame, or any 1600×840 screenshot tool)</p>
+</body>
+</html>
