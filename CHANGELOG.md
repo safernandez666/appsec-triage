@@ -4,7 +4,7 @@ All notable changes to **appsec-triage** are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] — 2026-06-02
 
 ### Added
 
@@ -15,6 +15,39 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repo's static structure (deploy artifacts, archived flag) doesn't reflect
   the actual blast radius. Missing file is silent; malformed entries log to
   stderr and are skipped. Bundled example: `.appsec-triage.example.toml`.
+- **Code-scanning-aware Prosecutor LLM-attack.** v0.2.1 disabled the stage-2
+  LLM-attack for non-Dependabot because the Dependabot prompt + EvidenceMatrix
+  produced 32/32 identical "no direct package usage hits or vulnerable API
+  usage hits" contradictions against a real code-scanning batch — structurally
+  vacuous reasoning about fields that don't apply to the source. v0.2.2 ships
+  a `PROSECUTOR_SYSTEM_PROMPT_CODE_SCANNING` system prompt and a dedicated
+  `_build_attack_payload_code_scanning` payload that explicitly forbid the
+  "no reachability evidence" line of reasoning and enumerate legitimate
+  attack angles for this source: vendored third-party paths
+  (`/node_modules/`, `/vendor/`, `/third_party/`, `/dist/`, `/build/`,
+  `.min.js`, `bootstrap-*.js`, `jquery-*.js`, `lodash-*.js`); generated or
+  compiled output; rule_ids with known FP rates against library code (e.g.
+  `js/xss-through-dom` against any DOM-manipulation library); internally
+  inconsistent verdict reasoning. `_llm_attack` dispatches on `alert.source`
+  to pick the right prompt/payload pair.
+- LLM-attack is **re-enabled for code-scanning** in `cli.py`; secret-scanning
+  still bypasses `prosecute()` via the Z1 short-circuit, so this is safe.
+
+### Verified
+
+- Run against `safernandez666/Controls` (32 code-scanning XSS findings,
+  all in vendored `bootstrap-*.js` / `jquery-*.js`). The verdict counts
+  did not move much — the Prosecutor still flips most to `needs_review`,
+  which is the correct outcome for XSS in vendored libraries that the
+  repo does not author — but every flip now carries a specific,
+  auditable argument like "The file 'bootstrap-material-design.js' is
+  a vendored third-party library, and the XSS risk identified is a
+  common false positive when analyzing libraries that manipulate the
+  DOM" instead of the previous useless "no reachability evidence"
+  loop. That argument lands in the Issue body, so the reviewer can
+  immediately decide whether to update Bootstrap or accept the risk.
+
+## [0.2.1] — 2026-06-02
 
 ## [0.2.1] — 2026-06-02
 
