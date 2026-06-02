@@ -318,22 +318,51 @@ def _maybe_dismiss(client, repo, alert, verdict, tier, flags):
 
 Lo más simple posible. Una sola dependencia runtime externa: `httpx`. Si lo podía hacer con stdlib de Python, lo hacía con stdlib. No hay ORM, no hay framework, no hay SDK de OpenAI — todo va por requests HTTP directos.
 
-Los números finales en v0.2.0:
+Los números:
 
-| Métrica | v0.1.0 | v0.2.0 |
-|---|---|---|
-| Lenguaje | Python 3.11+ | Python 3.11+ |
-| Módulos | 12 | 13 |
-| LOC totales | ~1.800 | ~3.000 |
-| Dependencia runtime | `httpx` (única) | `httpx` (única) |
-| Fuentes soportadas | Dependabot | Dependabot + CodeQL + Secret |
-| Truth Table rules | 2 (A, B) | 4 (A, B, C, D) |
-| Capas de guardrail tier-1 | 2 | 2 |
-| Capas de guardrail secret no-dismiss | — | 2 |
-| Empaquetado | `pyproject.toml` + setuptools | (igual) |
-| Entry point | `appsec-triage` | (igual) |
+| Métrica | v0.1.0 | v0.2.0 | v0.2.1 |
+|---|---|---|---|
+| Lenguaje | Python 3.11+ | Python 3.11+ | Python 3.11+ |
+| Módulos | 12 | 13 | 13 |
+| LOC totales | ~1.800 | ~3.000 | ~3.080 |
+| Dependencia runtime | `httpx` (única) | `httpx` (única) | `httpx` (única) |
+| Fuentes soportadas | Dependabot | Dependabot + CodeQL + Secret | (igual) |
+| Truth Table rules | 2 (A, B) | 4 (A, B, C, D) | (igual) |
+| Capas de guardrail tier-1 | 2 | 2 | 2 |
+| Capas de guardrail secret no-dismiss | — | 2 | 2 |
+| Modo batch multi-repo | — | — | `--repos` |
+| Empaquetado | `pyproject.toml` + setuptools | (igual) | (igual) |
+| Entry point | `appsec-triage` | (igual) | (igual) |
 
 Lo que **no** crecí: la dependencia runtime sigue siendo `httpx` solo, el entry point sigue siendo el mismo console script, y `--sources dependabot` (default) sigue produciendo output verbatim al de v0.1.0. Backward compatibility por contrato.
+
+---
+
+## De un repo a una flota chica (la v0.2.1)
+
+La v0.2.0 cubre las tres fuentes; la v0.2.1 cubre lo que viene cuando empezás a usarlo en serio: ya no tenés *un* repo, tenés veinte. Y la pregunta inmediata es "¿cómo lo corro contra todos sin armar una matrix de GitHub Actions ni un bash loop frágil?".
+
+La respuesta es un flag nuevo: `--repos`.
+
+```bash
+appsec-triage --repos org/svc-api,org/svc-web,org/internal-tools --auto-transition
+```
+
+Tres cosas que hace el modo batch que un loop de bash con `set -e` no:
+
+1. **Error isolation.** Cada repo se procesa en una función que **nunca lanza excepciones**. Errores de auth, fallas de fetch, crashes inesperados — todo se atrapa, se registra como un `_RepoResult` con su exit code, y se sigue con el próximo repo. Un repo que se rompe no aborta el batch. El camino single-repo `--repo` ahora reusa el mismo helper, así que la postura defensiva se comparte.
+2. **Resumen por repo al final.** Un bash loop te deja con miles de líneas de log mezcladas. El driver imprime al final un `ok` / `FAIL` por repo con fast-path count, continue count, y el mensaje de error cuando aplica. Auditeable en un `cron` sin scrollear.
+3. **Exit code honesto.** Si tres de cincuenta repos fallaron, el batch retorna el peor exit code visto — `cron` y los chequeos de CI siguen detectando la falla parcial en lugar de tragársela porque el último repo salió bien.
+
+Lo que **no** hace, y a propósito:
+
+- **No es paralelo.** GitHub tiene rate limits compartidos sobre un PAT. Paralelizar batches contra un solo token es más foot-gun que feature: la primer corrida te lo rompe. Si tu flota requiere paralelismo real, una matrix de Actions sigue siendo la herramienta correcta — el modo batch está pensado para hasta ~20 repos desde un solo cron o una laptop.
+- **No acepta config por archivo.** El flag toma una lista plana separada por comas y nada más. Si tu fleet es grande como para querer un YAML, ya superaste este modo.
+- **No tiene `--sources` por repo.** Las fuentes son globales al batch. Distintos modelos de riesgo por repo significan invocaciones distintas.
+
+Y el detalle que más me importa: **los guardrails tier-1 se evalúan por repo dentro del batch**. Un repo crítico adentro de un batch de cincuenta sigue sin ser auto-dismisseado, sin importar los flags alrededor. El "cinturón y tiradores" del tier-1 que mostré arriba sigue ahí — el batch driver le pasa exactamente las mismas flags al pipeline single-repo, no hay override batch-wide.
+
+> 💡 La lección de diseño de la v0.2.1 es chiquita pero útil: **cuando armás un wrapper batch, hacelo wrappear el pipeline single-repo que ya existe, no escribirlo de nuevo**. Mi primer instinto fue escribir un loop adentro de `run_online()` y compartir partes. Eso me hubiera duplicado la lógica de `httpx` setup, el context manager, el manejo de errores. La versión que terminó quedando extrae `_process_single_repo_online()` que nunca lanza, y tanto `run_online` como `run_online_multi` la consumen. Una función defensiva, dos drivers — uno corto, uno corto. La asimetría LLM/determinístico también aplica acá: las cosas que pueden romperse se aíslan en una capa que **no rompe el resto del sistema**.
 
 ---
 
@@ -378,11 +407,12 @@ Esto no es exclusivo de triage de vulnerabilidades. Aplica a cualquier sistema d
 
 ## Próximos pasos
 
-La v0.2.0 cubre las tres fuentes "obvias" de GitHub. Lo que viene después tiene varias direcciones posibles:
+La v0.2.0 cubrió las tres fuentes "obvias" de GitHub; la v0.2.1 cubrió el primer paso hacia operar más de un repo a la vez. Lo que viene después tiene varias direcciones posibles:
 
 - **Persistencia real del historial en CI**. Hoy es artifact-only. En producción lo persistís en S3, un gist privado o un repo dedicado de estado. Lo dejo documentado en el README.
 - **Otras fuentes de seguridad de GitHub**: la Dependency Review API en PR time (para bloquear merges con vulns sin tener que esperar al cron de Dependabot), supply chain attestations (cuando GitHub lo expanda a más ecosistemas), y eventualmente telemetría de runtime cuando exista una API estable.
 - **Adapter para otros LLMs**. Hoy asumo OpenAI-compatible. Bedrock InvokeModel, raw Anthropic API, o modelos self-hosted necesitan un adapter delgado. No es difícil, solo no estaba en scope.
+- **Config por archivo para flotas grandes**. El modo batch actual escala bien hasta ~20 repos con una lista comma-separated; más allá de eso lo correcto es un YAML por repo con sus tiers, fuentes, y overrides. Es trabajo, pero es claro.
 - **Métricas reales después de correrlo unos meses**. Cuántas alertas resuelve sin LLM (Truth Table). Cuántas resuelve por consenso. Cuántas terminan en `needs_review` y por qué. Tasa de revocación del Prosecutor. Eso es contenido para un Part 3 cuando tenga data.
 
 Si querés probarlo en tu propio repo, el README tiene un quick start de tres comandos:
@@ -393,7 +423,13 @@ cp .env.example .env       # poné tu PAT + LLM_API_KEY
 appsec-triage --repo owner/name --dry-run --sources all
 ```
 
-Y si te animás al `--auto-transition`, los guardrails tier-1 + secret-no-dismiss están ahí para vos.
+Y si querés probarlo en varios repos a la vez:
+
+```bash
+appsec-triage --repos org/svc-api,org/svc-web,org/internal-tools --dry-run --sources all
+```
+
+Si te animás al `--auto-transition`, los guardrails tier-1 + secret-no-dismiss están ahí para vos — funcionan igual en modo single-repo y batch.
 
 Seguiremos explorando esto en próximas entregas. Para mí lo más interesante del proyecto sigue siendo **la asimetría LLM/determinístico**, y cada extensión nueva la hace más evidente. Le estoy tomando el gusto.
 

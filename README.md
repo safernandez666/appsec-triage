@@ -8,7 +8,7 @@
 
 Multi-agent defensive triage of Dependabot alerts. Reduces false positives and the team's alert fatigue. GitHub-native. Python 3.11+. Single runtime dependency: `httpx`.
 
-> **Status:** v0.2.0. Ingests three sources: Dependabot, GitHub Code Scanning (CodeQL + 3rd-party SAST), and Secret Scanning. See [Sources](#sources).
+> **Status:** v0.2.1. Ingests three sources: Dependabot, GitHub Code Scanning (CodeQL + 3rd-party SAST), and Secret Scanning. See [Sources](#sources). Multi-repo batch mode via `--repos` — see [Batch mode](#batch-mode-multi-repo).
 
 ## Why this exists
 
@@ -36,9 +36,13 @@ appsec-triage --repo owner/name --dry-run
 # Online with auto-dismiss for high-confidence false positives.
 # Tier-1 (critical) repos are NEVER auto-dismissed. Non-negotiable.
 appsec-triage --repo owner/name --auto-transition
+
+# v0.2.1: batch a small fleet from one invocation. If one repo errors the
+# rest still run; a summary is printed at the end and the worst exit code wins.
+appsec-triage --repos owner/a,owner/b,owner/c --dry-run
 ```
 
-`--offline` and `--repo` are mutually exclusive. `--dry-run` and `--auto-transition` apply to both online and dry runs.
+`--offline`, `--repo`, and `--repos` are mutually exclusive. `--dry-run` and `--auto-transition` apply to every mode.
 
 > The console script `appsec-triage` and the legacy `python triage_cycle.py` are interchangeable. The shim exists so the spec wording (`python triage_cycle.py …`) keeps working, but post-install the console script is the idiomatic entry point.
 
@@ -127,15 +131,47 @@ Two consumers:
 
 In CI the runner is ephemeral and the file does not survive between runs by default. The shipped workflow uploads it as an artifact for audit. For production persist it to S3, a private gist, or a dedicated state repository.
 
+## Batch mode (multi-repo)
+
+`--repos` runs the full pipeline against a comma-separated list of repos from a single invocation. It exists because real teams own more than one repo, and the realistic alternatives — a bash loop with `set -e`, or a GitHub Actions matrix — are either fragile or heavy.
+
+```bash
+# Dry-run a fleet
+appsec-triage --repos org/svc-api,org/svc-web,org/internal-tools --dry-run
+
+# Same with all three sources and auto-dismiss enabled.
+# Tier-1 guardrails still apply per repo — no batch-wide override.
+appsec-triage \
+  --repos org/svc-api,org/svc-web,org/internal-tools \
+  --sources all \
+  --auto-transition
+```
+
+What you get over a bash loop:
+
+- **Error isolation.** A failing repo (auth, fetch, unexpected crash) does not abort the batch. The driver catches everything, records a `_RepoResult`, and moves to the next repo. The single-repo `--repo` path now reuses the same helper, so both paths share the same defensive behavior.
+- **Per-repo summary.** At the end you get `ok` / `FAIL` lines per repo with fast-path counts, continue counts, and the failure message when applicable — auditable in a `cron` log without scrolling.
+- **Honest exit code.** The overall exit code is the worst per-repo code, so `cron` / CI / Slack notifications still detect partial failure instead of swallowing it.
+
+What it does **not** do:
+
+- Per-repo `--sources` overrides — `--sources` is global to the batch. If you need different sources per repo, run multiple invocations.
+- Parallelism. The driver iterates serially. GitHub rate limits make parallel batches across one PAT a foot-gun more than a feature; an Actions matrix is still the right tool past ~20 repos.
+- Configuration files. The flag intentionally accepts a flat comma-separated list. If your fleet is large enough to need a YAML config, you have already outgrown this mode.
+
+Tier-1 guardrails are evaluated **per repo**: a critical repo inside a batch of fifty is still never auto-dismissed, regardless of the surrounding flags.
+
 ## Modes (recap)
 
-| Command                                                | What it does                                                                          |
-|--------------------------------------------------------|---------------------------------------------------------------------------------------|
-| `python triage_cycle.py --offline`                     | Bundled fixtures, no network, no LLM. Demonstrates both branches end-to-end.          |
-| `python triage_cycle.py --repo owner/name --dry-run`   | Hits GitHub, computes verdicts, **mutates nothing**.                                  |
-| `python triage_cycle.py --repo owner/name --auto-transition` | Hits GitHub, posts/closes Issues, dismisses high-confidence FPs (tier-1 still blocked). |
+| Command                                                              | What it does                                                                                              |
+|----------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
+| `appsec-triage --offline`                                            | Bundled fixtures, no network, no LLM. Demonstrates both branches end-to-end.                              |
+| `appsec-triage --repo owner/name --dry-run`                          | Hits GitHub for one repo, computes verdicts, **mutates nothing**.                                         |
+| `appsec-triage --repo owner/name --auto-transition`                  | Hits GitHub for one repo, posts/closes Issues, dismisses high-confidence FPs (tier-1 still blocked).      |
+| `appsec-triage --repos owner/a,owner/b --dry-run`                    | v0.2.1: batch mode. Same pipeline per repo with error isolation and a per-repo summary.                   |
+| `appsec-triage --repos owner/a,owner/b --auto-transition`            | v0.2.1: batch mode with auto-dismiss. Tier-1 still blocked per repo.                                      |
 
-Exit codes: `0` ok · `1` empty input · `2` arg or auth error · `3` fetch error (Z1 error-note path).
+Exit codes: `0` ok · `1` empty input · `2` arg or auth error · `3` fetch error (Z1 error-note path). In batch mode, the worst code seen across the batch is returned.
 
 ## Limitations (PoC)
 

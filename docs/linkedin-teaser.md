@@ -1,33 +1,37 @@
-# LinkedIn teaser — v0.2.0 release
+# LinkedIn teaser — v0.2.1 release
 
 **Cover image:** `docs/blog-cover.png` (1600×840 PNG, ya commiteado en el repo).
 **Length:** ~1700 chars (entra sin "ver más" en mobile).
 **Cierre con pregunta** → engagement hook para LinkedIn.
 
+> **Nota:** Esto reemplaza al teaser de v0.2.0. La narrativa de v0.2.0 (tres fuentes, LLM sandwicheado, guardrails con belt + suspenders) sigue intacta — la novedad de v0.2.1 es **operacional**: pasar de "un repo" a "una flota chica" sin perder los guardrails.
+
 ---
 
 ## Versión principal (ES) — copy-paste
 
-> **v0.2.0 del bot que tría tus alertas de Dependabot, CodeQL y Secret scanning está vivo.**
+> **v0.2.1 del bot que tría tus alertas de Dependabot, CodeQL y Secret scanning está vivo.**
 >
-> La decisión arquitectónica más importante: el LLM nunca actúa solo. Está sandwicheado entre dos capas determinísticas en Python puro.
+> La v0.2.0 le enseñó al bot a leer tres fuentes de seguridad de GitHub. La v0.2.1 le enseñó a correr contra una flota chica sin perder los guardrails. Un flag nuevo: `--repos org/a,org/b,org/c`.
 >
-> Antes del LLM, una Truth Table resuelve ~40% de los casos sin gastar un token (archivado + sin uso → false positive; advisory nombra APIs específicas y ninguna aparece en el código → false positive). Después del LLM, un Prosecutor adversarial puede degradar el veredicto si la evidencia local lo contradice, y un Critic silencioso lo baja a `needs_review` si la confianza no llega al floor del tier. El LLM aporta donde solo el lenguaje natural puede aportar — extraer APIs del advisory, redactar la conclusión legible que ve el reviewer. El resto es Python determinístico que vos podés auditar línea por línea.
+> Tres cosas que el modo batch hace y un loop de bash con `set -e` no:
 >
-> Tres guardrails no-negociables, los tres con cinturón y tiradores (dos capas independientes):
+> 1️⃣ Error isolation. Cada repo se procesa en un helper que **nunca lanza excepciones** — fallas de auth, fetch errors, crashes inesperados se atrapan, se registran con su exit code, y el batch sigue con el próximo. Un repo que se rompe no aborta los otros cuarenta y nueve. El camino single-repo `--repo` ahora comparte el mismo helper.
 >
-> 1️⃣ Tier-1 nunca auto-dismissea. `transition_floor = float("inf")` para que la comparación numérica no pueda pasar, más early return explícito en el dismiss handler.
+> 2️⃣ Resumen por repo al final. `ok` / `FAIL` por repo con fast-path count, continue count, y el mensaje de error cuando aplica. Auditeable en un `cron` log sin scrollear miles de líneas.
 >
-> 2️⃣ Secret scanning nunca auto-dismissea. El método dismiss directamente no existe en el GitHub client, más un guard return explícito en el handler. Una credencial leakeada no es una pregunta de "¿es reproducible?", es "rotar ya".
+> 3️⃣ Exit code honesto. El batch retorna el peor exit code visto — si tres de cincuenta repos fallaron, `cron` lo detecta. Nada de que el último repo salga ok y se trague la falla parcial.
 >
-> 3️⃣ `temperature=0` en cada llamada LLM. Mismo input → mismo veredicto, por contrato. Sin esto el Consistency Gate persigue su propia cola entre corridas.
+> Lo que **no** hace, a propósito: no es paralelo (los rate limits de GitHub sobre un PAT lo hacen foot-gun), no acepta config por archivo (si tu flota necesita YAML, ya superaste este modo), no permite `--sources` por repo (las fuentes son globales al batch).
 >
-> Stack: Python 3.11, una sola dependencia runtime (`httpx`), GitHub Actions con cron + workflow_dispatch. README en EN y ES. Modo `--offline` con fixtures para probarlo sin gastar tokens ni tocar tu repo.
+> Y lo importante: **los guardrails tier-1 se evalúan por repo dentro del batch**. Un repo crítico adentro de un batch de cincuenta sigue sin ser auto-dismisseado. El `transition_floor = inf` + early return explícito del tier-1, y el "secret-scanning no tiene método dismiss en el client" — todo intacto, todo aplica por repo.
+>
+> Stack: Python 3.11, una sola dependencia runtime (`httpx`), GitHub Actions cron + `workflow_dispatch`. README EN y ES. Modo `--offline` con fixtures para probarlo sin gastar tokens.
 >
 > Código: https://github.com/safernandez666/appsec-triage
-> Blog post completo con la historia: en breve.
+> Blog post completo: en breve.
 >
-> ¿Qué heurísticas determinísticas usás antes de meter un LLM en tu pipeline de seguridad?
+> Cuando armás un wrapper de batch sobre un pipeline existente, ¿lo hacés wrappear la función single o reescribís la lógica adentro del loop?
 >
 > #AppSec #SecurityEngineering #LLM #OpenSource
 
@@ -35,19 +39,19 @@
 
 ## Versión corta (~900 chars) — si tu feed prefiere posts breves
 
-> **v0.2.0 vivo.** Bot multi-agente que tría alertas de Dependabot, CodeQL y Secret scanning.
+> **v0.2.1 vivo.** El bot multi-agente que tría Dependabot + CodeQL + Secret scanning ahora corre contra una flota: `--repos org/a,org/b,org/c`.
 >
-> La decisión que más me costó pensar: el LLM nunca actúa solo. Lo sandwicheo entre dos capas determinísticas en Python puro. Una Truth Table resuelve ~40% sin tocar el modelo. Después, Prosecutor + Critic + Consistency pueden degradar el veredicto si la evidencia local lo contradice.
+> Tres cosas que el modo batch hace y un loop de bash con `set -e` no:
 >
-> Tres guardrails con belt + suspenders:
+> — Error isolation. Cada repo se procesa en un helper que **nunca lanza**. Un repo roto no aborta los demás.
+> — Resumen por repo al final (`ok` / `FAIL` + counts + error). Auditeable en un cron log.
+> — Exit code honesto. El batch retorna el peor exit code visto — `cron` detecta fallas parciales.
 >
-> — Tier-1 nunca auto-dismissea (`transition_floor = inf` + early return).
-> — Secret scanning nunca auto-dismissea (el método dismiss no existe en el client + guard explícito).
-> — `temperature=0` en cada llamada LLM.
+> Los guardrails tier-1 se evalúan **por repo dentro del batch**. Un crítico adentro de un batch de cincuenta sigue sin ser auto-dismisseado.
 >
 > https://github.com/safernandez666/appsec-triage
 >
-> ¿Qué heurísticas determinísticas tenés antes del LLM en tu pipeline?
+> Cuando wrappeás un pipeline existente con batch mode, ¿reusás la función single o reescribís la lógica?
 >
 > #AppSec #LLM #OpenSource
 
@@ -55,26 +59,28 @@
 
 ## Versión en inglés — para alcance internacional
 
-> **v0.2.0 of the bot that triages your Dependabot, CodeQL, and Secret scanning alerts is live.**
+> **v0.2.1 of the bot that triages your Dependabot, CodeQL, and Secret scanning alerts is live.**
 >
-> The most important architectural decision: the LLM never acts alone. It's sandwiched between two deterministic layers in pure Python.
+> v0.2.0 taught the bot to read three GitHub security signals. v0.2.1 teaches it to run against a small fleet without losing the guardrails. New flag: `--repos org/a,org/b,org/c`.
 >
-> Before the LLM, a Truth Table resolves ~40% of cases without spending a token (archived + unused → false positive; advisory names specific APIs and none appear in code → false positive). After the LLM, an adversarial Prosecutor can downgrade the verdict when local evidence contradicts it, and a silent Critic drops it to `needs_review` if confidence doesn't clear the tier floor. The LLM contributes where only natural language can — extracting APIs from advisories, writing the human-readable conclusion. The rest is deterministic Python you can audit line by line.
+> Three things the batch mode does that a bash loop with `set -e` does not:
 >
-> Three non-negotiable guardrails, each with belt + suspenders (two independent layers):
+> 1️⃣ Error isolation. Each repo runs inside a helper that **never raises** — auth failures, fetch errors, unexpected crashes are caught, recorded with their exit code, and the batch moves to the next repo. One blown-up repo cannot abort the other forty-nine. The single-repo `--repo` path now shares the same helper.
 >
-> 1️⃣ Tier-1 repos never auto-dismiss. `transition_floor = float("inf")` so the numeric comparison can't pass, plus an explicit early return in the dismiss handler.
+> 2️⃣ Per-repo summary at the end. `ok` / `FAIL` per repo with fast-path count, continue count, and the failure message when applicable. Auditable in a `cron` log without scrolling thousands of lines.
 >
-> 2️⃣ Secret scanning never auto-dismisses. The dismiss method doesn't exist on the GitHub client at all, plus a guard return in the handler. A leaked credential is not a "is this reproducible?" question — it's "rotate now".
+> 3️⃣ Honest exit code. The batch returns the worst exit code seen — if three out of fifty repos failed, `cron` detects it. Nothing about the last repo succeeding silently swallowing the partial failure.
 >
-> 3️⃣ `temperature=0` on every LLM call. Same input → same verdict, by contract. Otherwise the Consistency Gate chases its own tail across runs.
+> What it does **not** do, on purpose: it isn't parallel (GitHub rate limits on a shared PAT make parallel batches a foot-gun), it doesn't accept a config file (if your fleet needs YAML, you've outgrown this mode), and it doesn't allow `--sources` overrides per repo (sources are global to the batch).
 >
-> Stack: Python 3.11, single runtime dependency (`httpx`), GitHub Actions cron + `workflow_dispatch`. README in EN and ES. An `--offline` mode with fixtures lets you exercise the whole pipeline without spending tokens or touching your repo.
+> And the important part: **tier-1 guardrails are evaluated per repo inside the batch**. A critical repo inside a fifty-repo batch still never auto-dismisses. The `transition_floor = inf` + explicit early return for tier-1, and the "secret scanning has no dismiss method on the client at all" — all intact, all per repo.
+>
+> Stack: Python 3.11, single runtime dependency (`httpx`), GitHub Actions cron + `workflow_dispatch`. EN and ES READMEs. `--offline` mode with fixtures lets you exercise the whole pipeline without spending tokens.
 >
 > Code: https://github.com/safernandez666/appsec-triage
 > Full blog post: coming soon.
 >
-> What deterministic heuristics do you run before reaching for the LLM in your security pipeline?
+> When you wrap a batch driver around an existing single-target pipeline, do you make it reuse the single-target function, or do you rewrite the logic inside the loop?
 >
 > #AppSec #SecurityEngineering #LLM #OpenSource
 
@@ -98,3 +104,5 @@
   - La pregunta abierta del cierre (el algoritmo prioriza posts con replies).
   - Citar a alguien específico que sepas que tiene opinión técnica sobre el tema (en comments, no en el post — el @ en el body baja reach).
   - Responder vos mismo el primer comment con un detalle extra ("una cosa que no entró: …") — duplica las replies.
+
+- **Si querés mantener la v0.2.0 viva**: el teaser de v0.2.0 está en el git history (commit `d43c15f`). Si todavía no posteaste v0.2.0, considerá postearla primero y dejar v0.2.1 para una semana después — dos releases en el mismo día se canibalizan el algoritmo.

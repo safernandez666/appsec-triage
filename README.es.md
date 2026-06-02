@@ -8,7 +8,7 @@
 
 Triaje defensivo multi-agente de alertas de Dependabot. Reduce los falsos positivos y la fatiga de alertas del equipo. GitHub-native. Python 3.11+. Única dependencia runtime: `httpx`.
 
-> **Estado:** v0.2.0. Ingiere tres fuentes: Dependabot, GitHub Code Scanning (CodeQL + SAST de terceros), y Secret Scanning. Ver [Fuentes](#fuentes).
+> **Estado:** v0.2.1. Ingiere tres fuentes: Dependabot, GitHub Code Scanning (CodeQL + SAST de terceros), y Secret Scanning. Ver [Fuentes](#fuentes). Modo batch multi-repo via `--repos` — ver [Modo batch](#modo-batch-multi-repo).
 
 ## Por qué existe
 
@@ -36,9 +36,14 @@ appsec-triage --repo owner/name --dry-run
 # Online con auto-dismiss para falsos positivos de alta confianza.
 # Los repos tier-1 (críticos) NUNCA se auto-dismissean. No negociable.
 appsec-triage --repo owner/name --auto-transition
+
+# v0.2.1: batch sobre una flota chica desde una sola invocación. Si un repo
+# falla, el resto sigue corriendo; al final se imprime un resumen y gana el
+# peor exit code.
+appsec-triage --repos owner/a,owner/b,owner/c --dry-run
 ```
 
-`--offline` y `--repo` son mutuamente excluyentes. `--dry-run` y `--auto-transition` aplican tanto a corridas online como a dry runs.
+`--offline`, `--repo` y `--repos` son mutuamente excluyentes. `--dry-run` y `--auto-transition` aplican a todos los modos.
 
 > El console script `appsec-triage` y el legacy `python triage_cycle.py` son intercambiables. El shim existe para que el wording original del spec (`python triage_cycle.py …`) siga funcionando, pero después de instalar el console script es el entry point idiomático.
 
@@ -127,15 +132,47 @@ Dos consumers:
 
 En CI el runner es efímero y el archivo no sobrevive entre runs por default. El workflow incluido sube el archivo como artifact para auditoría. Para producción, persistilo en S3, un gist privado, o un repositorio de estado dedicado.
 
+## Modo batch (multi-repo)
+
+`--repos` corre el pipeline completo contra una lista separada por comas de repos en una sola invocación. Existe porque los equipos reales tienen más de un repo, y las alternativas — un loop de bash con `set -e`, o una matrix de GitHub Actions — son frágiles o pesadas.
+
+```bash
+# Dry-run sobre una flota
+appsec-triage --repos org/svc-api,org/svc-web,org/internal-tools --dry-run
+
+# Lo mismo con las tres fuentes y auto-dismiss activado.
+# Los guardrails tier-1 siguen aplicando por repo — no hay override batch-wide.
+appsec-triage \
+  --repos org/svc-api,org/svc-web,org/internal-tools \
+  --sources all \
+  --auto-transition
+```
+
+Qué ganás contra un loop de bash:
+
+- **Aislamiento de errores.** Un repo que falla (auth, fetch, crash inesperado) no aborta el batch. El driver atrapa todo, registra un `_RepoResult`, y pasa al siguiente. El camino single-repo `--repo` ahora reusa el mismo helper, así que ambos paths comparten la misma postura defensiva.
+- **Resumen por repo.** Al final ves líneas `ok` / `FAIL` por repo con fast-path counts, continue counts, y el mensaje de error cuando aplica — auditeable en un log de `cron` sin scrollear.
+- **Exit code honesto.** El exit code global es el peor exit code visto por repo, así que `cron` / CI / notificaciones a Slack siguen detectando fallas parciales en lugar de tragárselas.
+
+Qué **no** hace:
+
+- Override de `--sources` por repo — `--sources` es global al batch. Si necesitás distintas fuentes por repo, corré múltiples invocaciones.
+- Paralelismo. El driver itera serial. Los rate limits de GitHub hacen que batches paralelos sobre un PAT sean más foot-gun que feature; una matrix de Actions sigue siendo la herramienta correcta más allá de ~20 repos.
+- Archivos de configuración. El flag acepta a propósito una lista plana separada por comas. Si tu flota necesita un YAML, ya superaste este modo.
+
+Los guardrails tier-1 se evalúan **por repo**: un repo crítico dentro de un batch de cincuenta sigue sin ser auto-dismisseado, sin importar los flags alrededor.
+
 ## Modos (recap)
 
-| Comando                                                | Qué hace                                                                              |
-|--------------------------------------------------------|---------------------------------------------------------------------------------------|
-| `python triage_cycle.py --offline`                     | Fixtures incluidas, sin red, sin LLM. Demuestra ambas ramas end-to-end.               |
-| `python triage_cycle.py --repo owner/name --dry-run`   | Llama a GitHub, computa veredictos, **no muta nada**.                                 |
-| `python triage_cycle.py --repo owner/name --auto-transition` | Llama a GitHub, postea/cierra Issues, dismissea FPs de alta confianza (tier-1 sigue bloqueado). |
+| Comando                                                            | Qué hace                                                                                            |
+|--------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
+| `appsec-triage --offline`                                          | Fixtures incluidas, sin red, sin LLM. Demuestra ambas ramas end-to-end.                             |
+| `appsec-triage --repo owner/name --dry-run`                        | Llama a GitHub para un repo, computa veredictos, **no muta nada**.                                  |
+| `appsec-triage --repo owner/name --auto-transition`                | Llama a GitHub para un repo, postea/cierra Issues, dismissea FPs de alta confianza (tier-1 sigue bloqueado). |
+| `appsec-triage --repos owner/a,owner/b --dry-run`                  | v0.2.1: modo batch. Mismo pipeline por repo con error isolation y resumen por repo.                 |
+| `appsec-triage --repos owner/a,owner/b --auto-transition`          | v0.2.1: modo batch con auto-dismiss. Tier-1 sigue bloqueado por repo.                               |
 
-Exit codes: `0` ok · `1` input vacío · `2` error de argumentos o auth · `3` error de fetch (camino Z1 error-note).
+Exit codes: `0` ok · `1` input vacío · `2` error de argumentos o auth · `3` error de fetch (camino Z1 error-note). En modo batch, el peor exit code del batch es el que retorna.
 
 ## Limitaciones (PoC)
 
