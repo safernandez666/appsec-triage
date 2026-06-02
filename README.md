@@ -1,5 +1,11 @@
 # AppSec Triage Bot
 
+<!-- README-I18N:START -->
+
+**English** | [Español](./README.es.md)
+
+<!-- README-I18N:END -->
+
 Multi-agent defensive triage of Dependabot alerts. Reduces false positives and the team's alert fatigue. GitHub-native. Python 3.11+. Single runtime dependency: `httpx`.
 
 > **Status:** Proof of Concept. v1 consumes Dependabot alerts only. CodeQL and secret scanning are documented [extension hooks](#extending-to-v2) for v2.
@@ -9,6 +15,10 @@ Multi-agent defensive triage of Dependabot alerts. Reduces false positives and t
 Dependabot is great at finding vulnerable dependencies and noisy at telling you which ones actually affect *your* repository. After a few months you have a backlog of advisories nobody triages, a Slack channel of resolved-to-stale alerts, and the team starts ignoring real findings.
 
 This bot reads Dependabot alerts and answers, per alert: **does this affect us?** It produces a `false_positive` / `reproducible` / `needs_review` verdict with a plain-English conclusion you can read in a GitHub Issue. False positives can be auto-dismissed (configurable, never in tier-1 repos). Reproducibles stay open for the team to fix. `needs_review` means the bot itself isn't sure — humans decide.
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="Pipeline architecture: Z1 routing → Z2 investigation → Z3 judgment → Z4 output. Tier-1 guardrail in coral." width="720"/>
+</p>
 
 ## Quick start
 
@@ -56,6 +66,12 @@ Every alert passes through deterministic gates on the way in (Truth Table) and o
 ```
 Z1 routing  →  Z2 investigation (deterministic + LLM-extraction)  →  Z3 judgment  →  Z4 output
 ```
+
+<p align="center">
+  <img src="docs/sequence.svg" alt="One alert traced end to end across CLI, GitHub, LLM, deterministic engine, and history store. Coral = primary return from the Judge." width="880"/>
+</p>
+
+<p align="center"><sub><em>An alert traced end to end. The coral arrow is the Judge's verdict — the central decision; everything else is plumbing.</em></sub></p>
 
 ### Zone 1 — Routing
 
@@ -168,6 +184,7 @@ appsec-triage/
 │   ├── consistency.py           # Z3 anti flip-flop + history append
 │   └── issue_manager.py         # Z4 Issue + Dependabot dismiss + tier-1 guardrail
 ├── fixtures/alerts/             # offline demo data
+├── docs/                        # diagrams (architecture.svg + sequence.svg + HTML versions)
 ├── .github/workflows/triage.yml # cron + workflow_dispatch
 ├── pyproject.toml               # package metadata + entry point (source of truth)
 ├── requirements.txt             # kept for ad-hoc local installs (httpx only)
