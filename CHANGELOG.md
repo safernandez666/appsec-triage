@@ -4,6 +4,39 @@ All notable changes to **appsec-triage** are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-06-02
+
+### Added
+
+- **Multi-repo batch mode.** New `--repos owner/a,owner/b,owner/c` CLI flag
+  iterates the full triage pipeline over a comma-separated list of repos in a
+  single invocation. Mutually exclusive with `--offline` and `--repo`. Useful
+  for running the bot from a laptop or a single cron against a small fleet of
+  repos without setting up a GitHub Actions matrix.
+- **Error isolation between repos.** Each repo is processed inside
+  `_process_single_repo_online`, which never raises — argument errors, missing
+  `httpx`, GitHub fetch failures, and unexpected pipeline crashes are caught
+  and recorded as a `_RepoResult` with a non-zero exit code. One repo blowing
+  up cannot abort the batch. The single-repo `--repo` path now reuses the
+  same helper so it gets the same defensive behavior for free.
+- **Per-repo summary.** The batch run prints a final summary listing each
+  repo with `ok` / `FAIL`, fast-path count, continue count, and the error
+  message when applicable. The overall exit code is the worst exit code seen
+  across the batch, so `cron` / CI still detects partial failure.
+- **Startup banner.** Truecolor `APPSEC` banner with a violet → orange
+  gradient is printed to **stderr** at CLI start so it never pollutes
+  stdout. Auto-disabled when stderr is not a TTY (cron, pipes, CI). Set
+  `APPSEC_NO_BANNER=1` or `NO_COLOR=1` for an explicit opt-out. New module
+  `triage/banner.py` (no new runtime dependencies).
+
+### Unchanged (still enforced)
+
+- Tier-1 (critical) repos are still NEVER auto-dismissed, even inside a batch.
+- Secret-scanning alerts are still never auto-dismissed regardless of flag.
+- `--sources` and per-source filtering apply identically to every repo in the
+  batch. No way to ingest different sources per repo from one invocation;
+  that would require a config file and is intentionally out of scope.
+
 ## [0.2.0] — 2026-06-01
 
 ### Added

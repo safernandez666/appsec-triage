@@ -14,9 +14,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from triage.advisory_agent import AdvisoryResult, extract_vulnerable_apis
+from triage.banner import print_banner
 from triage.consistency import (
     ConsistencyAction,
     ConsistencyDecision,
@@ -484,17 +486,33 @@ def run_offline(flags: CycleFlags | None = None) -> int:
     return 0
 
 
-def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
-    flags = flags or CycleFlags()
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("[online] GITHUB_TOKEN not set in env. See .env.example.", file=sys.stderr)
-        return 2
+@dataclass(frozen=True)
+class _RepoResult:
+    """v0.2.1: per-repo result used by the multi-repo summary."""
+    repo: str
+    exit_code: int
+    fast_path: int
+    cont: int
+    error: str = ""
+
+
+def _process_single_repo_online(
+    repo_arg: str,
+    token: str,
+    flags: CycleFlags,
+) -> _RepoResult:
+    """Run the full pipeline against ONE online repo. Never raises.
+
+    Returns _RepoResult so the multi-repo driver can decide how to react.
+    The single-repo `run_online` wraps this and exits with the returned code;
+    the multi-repo `run_online_multi` collects N of these and prints a summary.
+    """
     try:
         owner, name = repo_arg.split("/", 1)
     except ValueError:
-        print(f"[online] --repo must be owner/name, got {repo_arg!r}", file=sys.stderr)
-        return 2
+        msg = f"--repo / --repos entry must be owner/name, got {repo_arg!r}"
+        print(f"[args] {msg}", file=sys.stderr)
+        return _RepoResult(repo_arg, 2, 0, 0, "invalid name")
     try:
         client = GitHubClient(token)
     except ImportError:
@@ -502,43 +520,100 @@ def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
             "[online] httpx is not installed. Run: pip install -r requirements.txt",
             file=sys.stderr,
         )
-        return 2
-    with client:
-        try:
-            repo = client.get_repo(owner, name)
-            alerts: list[Alert] = []
-            if AlertSource.DEPENDABOT in flags.sources:
-                alerts.extend(client.list_dependabot_alerts(owner, name))
-            if AlertSource.CODE_SCANNING in flags.sources:
-                alerts.extend(client.list_code_scanning_alerts(owner, name))
-            if AlertSource.SECRET_SCANNING in flags.sources:
-                alerts.extend(client.list_secret_scanning_alerts(owner, name))
-        except Exception as e:
+        return _RepoResult(repo_arg, 2, 0, 0, "httpx not installed")
+    try:
+        with client:
+            try:
+                repo = client.get_repo(owner, name)
+                alerts: list[Alert] = []
+                if AlertSource.DEPENDABOT in flags.sources:
+                    alerts.extend(client.list_dependabot_alerts(owner, name))
+                if AlertSource.CODE_SCANNING in flags.sources:
+                    alerts.extend(client.list_code_scanning_alerts(owner, name))
+                if AlertSource.SECRET_SCANNING in flags.sources:
+                    alerts.extend(client.list_secret_scanning_alerts(owner, name))
+            except Exception as e:
+                msg = f"{type(e).__name__}: {e}"
+                print(
+                    f"[Z1 error note] GitHub fetch failed for {repo_arg}: {msg}",
+                    file=sys.stderr,
+                )
+                return _RepoResult(repo_arg, 3, 0, 0, msg)
+
+            sets = [RepoAlertSet(repo, alerts)]
+            sources_str = ",".join(sorted(s.value for s in flags.sources))
+            by_src = {s.value: 0 for s in flags.sources}
+            for a in alerts:
+                by_src[a.source.value] = by_src.get(a.source.value, 0) + 1
+            breakdown = ",".join(f"{k}={v}" for k, v in sorted(by_src.items()))
             print(
-                f"[Z1 error note] GitHub fetch failed for {repo_arg}: "
-                f"{type(e).__name__}: {e}",
-                file=sys.stderr,
+                f"[online] {len(alerts)} open alert(s) in {repo.full_name} "
+                f"[{breakdown}]  "
+                f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
+                f"sources={sources_str}}}"
             )
-            return 3
-        sets = [RepoAlertSet(repo, alerts)]
-        sources_str = ",".join(sorted(s.value for s in flags.sources))
-        # Per-source breakdown so the operator can see what came back.
-        by_src = {s.value: 0 for s in flags.sources}
-        for a in alerts:
-            by_src[a.source.value] = by_src.get(a.source.value, 0) + 1
-        breakdown = ",".join(f"{k}={v}" for k, v in sorted(by_src.items()))
+            fast, cont = _route_and_print(sets, client, flags)
+            return _RepoResult(repo_arg, 0, fast, cont)
+    except Exception as e:
+        # Catch-all so one repo crashing inside the pipeline cannot kill a
+        # batch of 50. The single-repo path also benefits: any unexpected
+        # bug surfaces as a clean exit 3 with a message, not a stack trace.
+        return _RepoResult(repo_arg, 3, 0, 0, f"{type(e).__name__}: {e}")
+
+
+def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
+    flags = flags or CycleFlags()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("[online] GITHUB_TOKEN not set in env. See .env.example.", file=sys.stderr)
+        return 2
+    result = _process_single_repo_online(repo_arg, token, flags)
+    if result.exit_code == 0:
         print(
-            f"[online] {len(alerts)} open alert(s) in {repo.full_name} "
-            f"[{breakdown}]  "
-            f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
-            f"sources={sources_str}}}"
+            f"[online] cycle complete — fast_path={result.fast_path} continue={result.cont}"
         )
-        fast, cont = _route_and_print(sets, client, flags)
+    return result.exit_code
+
+
+def run_online_multi(repos_arg: str, flags: CycleFlags | None = None) -> int:
+    """v0.2.1: iterate a comma-separated list of repos with error isolation.
+
+    Returns 0 only if EVERY repo returned 0. If any repo failed we return the
+    worst exit code seen so callers (cron, CI) can still detect partial failure
+    without losing the per-repo summary. One blown-up repo can never abort the
+    batch — that is the whole point of this driver vs running --repo in a bash
+    loop with `set -e`.
+    """
+    flags = flags or CycleFlags()
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("[online] GITHUB_TOKEN not set in env. See .env.example.", file=sys.stderr)
+        return 2
+    repos = [r.strip() for r in repos_arg.split(",") if r.strip()]
+    if not repos:
+        print("[online] --repos was empty after parsing", file=sys.stderr)
+        return 2
+    print(f"[online-batch] processing {len(repos)} repo(s)")
+    results: list[_RepoResult] = []
+    for i, repo_arg in enumerate(repos, 1):
+        print(f"\n[online-batch] ({i}/{len(repos)}) {repo_arg}")
+        results.append(_process_single_repo_online(repo_arg, token, flags))
+    # Per-repo summary so a 50-repo run still leaves a readable trail.
+    print("\n[online-batch] summary")
+    ok = sum(1 for r in results if r.exit_code == 0)
+    fast_total = sum(r.fast_path for r in results)
+    cont_total = sum(r.cont for r in results)
+    for r in results:
+        if r.exit_code == 0:
+            print(f"  ok    {r.repo}  fast_path={r.fast_path} continue={r.cont}")
+        else:
+            print(f"  FAIL  {r.repo}  exit={r.exit_code}  {r.error}")
     print(
-        f"[online] cycle complete — "
-        f"fast_path={fast} continue={cont}"
+        f"[online-batch] complete — {ok}/{len(results)} ok  "
+        f"fast_path={fast_total} continue={cont_total}"
     )
-    return 0
+    # Worst exit code wins so `cron` / CI still sees partial failure.
+    return max((r.exit_code for r in results), default=0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -560,7 +635,18 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--repo",
         metavar="OWNER/NAME",
-        help="Target repo as owner/name. Requires GITHUB_TOKEN in env.",
+        help="Target a single repo as owner/name. Requires GITHUB_TOKEN in env.",
+    )
+    mode.add_argument(
+        "--repos",
+        metavar="LIST",
+        help=(
+            "v0.2.1: comma-separated list of repos (e.g. org/a,org/b,org/c). "
+            "Iterates with fail-fast off — if one repo errors, the rest still run. "
+            "Prints a per-repo summary at the end. Same GITHUB_TOKEN must have "
+            "access to every listed repo. Useful for batch runs from a laptop "
+            "or a single cron without setting up an Actions matrix."
+        ),
     )
     p.add_argument(
         "--dry-run",
@@ -590,6 +676,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    print_banner()
     args = build_parser().parse_args(argv)
     try:
         sources = _parse_sources(args.sources)
@@ -605,5 +692,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_offline(flags)
     if args.repo:
         return run_online(args.repo, flags)
+    if args.repos:
+        return run_online_multi(args.repos, flags)
     build_parser().print_help()
     return 0
