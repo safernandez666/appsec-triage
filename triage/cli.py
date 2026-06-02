@@ -19,6 +19,7 @@ from pathlib import Path
 
 from triage.advisory_agent import AdvisoryResult, extract_vulnerable_apis
 from triage.banner import print_banner
+from triage.env_loader import load_dotenv
 from triage.consistency import (
     ConsistencyAction,
     ConsistencyDecision,
@@ -496,6 +497,31 @@ class _RepoResult:
     error: str = ""
 
 
+def _normalize_repo_arg(arg: str) -> str:
+    """Accept owner/name, github.com/owner/name, full URLs, or SSH form.
+
+    Real users paste GitHub URLs straight from the browser; refusing them
+    burns a CLI invocation on a silent split-into-wrong-pieces. This
+    accepts the common surface shapes and normalizes them to `owner/name`.
+    """
+    a = arg.strip()
+    for prefix in (
+        "https://",
+        "http://",
+        "ssh://git@github.com/",
+        "git@github.com:",
+    ):
+        if a.startswith(prefix):
+            a = a[len(prefix):]
+            break
+    if a.startswith("github.com/"):
+        a = a[len("github.com/"):]
+    a = a.rstrip("/")
+    if a.endswith(".git"):
+        a = a[: -len(".git")]
+    return a
+
+
 def _process_single_repo_online(
     repo_arg: str,
     token: str,
@@ -507,10 +533,21 @@ def _process_single_repo_online(
     The single-repo `run_online` wraps this and exits with the returned code;
     the multi-repo `run_online_multi` collects N of these and prints a summary.
     """
+    normalized = _normalize_repo_arg(repo_arg)
     try:
-        owner, name = repo_arg.split("/", 1)
+        owner, name = normalized.split("/", 1)
     except ValueError:
-        msg = f"--repo / --repos entry must be owner/name, got {repo_arg!r}"
+        msg = (
+            f"--repo / --repos entry must be owner/name or a GitHub URL, "
+            f"got {repo_arg!r}"
+        )
+        print(f"[args] {msg}", file=sys.stderr)
+        return _RepoResult(repo_arg, 2, 0, 0, "invalid name")
+    if not owner or "/" in name:
+        msg = (
+            f"--repo / --repos entry parsed to {owner!r}/{name!r}; expected "
+            f"a single owner/name pair from {repo_arg!r}"
+        )
         print(f"[args] {msg}", file=sys.stderr)
         return _RepoResult(repo_arg, 2, 0, 0, "invalid name")
     try:
@@ -676,6 +713,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load .env from cwd before anything reads os.environ. Existing shell
+    # exports always win (see env_loader docstring), so explicit overrides
+    # like `GITHUB_TOKEN=other appsec-triage …` still work for one-offs.
+    load_dotenv()
     print_banner()
     args = build_parser().parse_args(argv)
     try:

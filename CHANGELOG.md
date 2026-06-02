@@ -28,6 +28,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stdout. Auto-disabled when stderr is not a TTY (cron, pipes, CI). Set
   `APPSEC_NO_BANNER=1` or `NO_COLOR=1` for an explicit opt-out. New module
   `triage/banner.py` (no new runtime dependencies).
+- **Auto-load `.env` from cwd.** `triage/env_loader.py` reads `KEY=VALUE`
+  pairs at CLI start so users no longer need `set -a; source .env; set +a`
+  before every invocation. Existing shell exports always win, matching
+  the python-dotenv default — explicit overrides like
+  `GITHUB_TOKEN=other appsec-triage …` keep working for one-off runs.
+  Tolerates `# comments`, `export KEY=…` lines, quoted values, and
+  inline `# trailing` comments on unquoted values.
+- **`--repo` / `--repos` accept GitHub URLs.** `_normalize_repo_arg` peels
+  off `https://`, `http://`, `git@github.com:`, `ssh://git@github.com/`,
+  bare `github.com/`, trailing `/`, and a trailing `.git` so that
+  `--repo https://github.com/owner/name` or
+  `git@github.com:owner/name.git` both normalize to `owner/name` instead
+  of silently splitting into wrong pieces.
 
 ### Unchanged (still enforced)
 
