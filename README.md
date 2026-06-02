@@ -59,9 +59,56 @@ pip install -e ".[dev]"          # adds pytest + ruff
 | `LLM_BASE_URL`  | OpenAI-compatible chat completions endpoint. Defaults to `https://api.openai.com/v1`. Point at your gateway. |
 | `LLM_API_KEY`   | Bearer token for the LLM. If missing, Advisory returns `()`, Judge degrades to `needs_review` fallback.       |
 | `LLM_MODEL`     | Model id. Defaults to `gpt-4o-mini`. Any model that honors `temperature=0` and `response_format=json_object`. |
-| `GITHUB_TOKEN`  | PAT (or App token) with `security_events:write` + `issues:write`.                                            |
+| `GITHUB_TOKEN`  | Fine-grained PAT (or App token) — see [GitHub PAT permissions](#github-pat-permissions) for the exact scopes.|
 
 All LLM calls use `temperature=0` by contract. Same input → same verdict, by design.
+
+The bot auto-loads `.env` from the current working directory at startup, so a populated `.env` is enough — you do not need to `source` it in your shell. Existing shell exports always win over the file, matching the python-dotenv default.
+
+### GitHub PAT permissions
+
+The bot performs five categories of GitHub API calls. A real-world rollout against `safernandez666/Controls` surfaced two failure modes — Issue **creates** worked but **comments** returned `403 "Resource not accessible by personal access token"`, and **label creation** also returned `403`. The table below is the minimum surface the bot uses, with the exact symptom you will see when each permission is missing.
+
+#### Fine-grained PAT (recommended)
+
+| Permission                                | Access            | Used for                                                                                                                                   | Symptom when missing                                                                  |
+|-------------------------------------------|-------------------|--------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| **Metadata**                              | Read (auto)       | `GET /repos/{o}/{r}` — `archived`, `language`, default branch, age                                                                         | Cannot select the repo at all                                                          |
+| **Contents**                              | Read              | `GET /search/code` — reachability evidence (Dependabot only)                                                                                | Every Dependabot evidence row reports `direct_hits=0` even when the package is used    |
+| **Issues**                                | **Read and write**| `GET /repos/{o}/{r}/issues`, `POST .../issues`, `POST .../issues/{n}/comments`, `PATCH .../issues/{n}` (close)                              | `403` on comment endpoint — verdict-flips show up in the summary as `BLOCKED` actions  |
+| **Dependabot alerts**                     | Read for dry-run, **Read and write** for `--auto-transition` | `GET /repos/{o}/{r}/dependabot/alerts` and `PATCH .../dependabot/alerts/{n}` to dismiss                                                    | `403` on `--auto-transition` dismiss step                                              |
+| **Code scanning alerts**                  | Read for dry-run, **Read and write** for `--auto-transition` | `GET /repos/{o}/{r}/code-scanning/alerts` and `PATCH .../code-scanning/alerts/{n}` to dismiss                                              | Same as above                                                                          |
+| **Secret scanning alerts**                | Read              | `GET /repos/{o}/{r}/secret-scanning/alerts` only — **the bot never dismisses secrets** regardless of flags                                  | Secret source returns empty                                                            |
+| ~~Administration~~                        | ~~Write~~         | Used by `ensure_label` (creates the `autotriage` label). **Not recommended** — `Administration: write` is a very strong scope.             | One-time `403` warning at cycle start. Workaround: create the `autotriage` label manually once (see below). |
+
+If you only need read access for a `--dry-run` rehearsal, the bot will compute every verdict but mutate nothing — you can use Read-only on the three alert sources and skip the label create. Once you graduate to live mode, raise Issues and the two alert categories you want auto-dismissed to Read and write.
+
+#### Classic PAT (if fine-grained is unavailable)
+
+- `repo` for private repos or `public_repo` for public repos (covers Issues + Search Code)
+- `security_events` (covers Dependabot + Code Scanning read + write)
+- Secret Scanning Alerts ride on `repo` automatically — there is no separate scope in classic PATs, which is one reason fine-grained is preferred
+
+#### Pre-flight check
+
+After updating the PAT, verify the comment endpoint before re-running the bot:
+
+```bash
+python -c "
+import os, httpx
+from triage.env_loader import load_dotenv
+load_dotenv()
+tok = os.environ['GITHUB_TOKEN']
+r = httpx.post(
+    f'https://api.github.com/repos/<owner>/<repo>/issues/<existing-issue-#>/comments',
+    headers={'Authorization': f'token {tok}', 'Accept': 'application/vnd.github+json'},
+    json={'body': 'PAT permission test — ignore, will delete'},
+)
+print(r.status_code, r.text[:200])
+"
+```
+
+`201 Created` means comments work — delete the test comment, run the bot. `403` means the PAT still needs the Issues write upgrade.
 
 ## Architecture — the LLM never acts alone
 
@@ -160,6 +207,109 @@ What it does **not** do:
 - Configuration files. The flag intentionally accepts a flat comma-separated list. If your fleet is large enough to need a YAML config, you have already outgrown this mode.
 
 Tier-1 guardrails are evaluated **per repo**: a critical repo inside a batch of fifty is still never auto-dismissed, regardless of the surrounding flags.
+
+## Putting it in production
+
+A step-by-step that mirrors what we did to onboard the first real repository. Follow it in order — each step is meant to surface failures cheaply before the next one mutates state.
+
+### Step 1 — Generate the PAT correctly the first time
+
+Use a fine-grained PAT scoped to **only the repos you intend to triage**. See [GitHub PAT permissions](#github-pat-permissions) for the exact matrix. Do not skip the pre-flight check at the end of that section — it costs ten seconds and catches the most common misconfiguration (Issues: Read only instead of Read and write).
+
+### Step 2 — Seed the `autotriage` label manually
+
+The bot tries to create the label at cycle start, but `Administration: write` is a stronger permission than you should give a triage bot. Create the label once via the GitHub UI: **Repo → Issues → Labels → New label**, name `autotriage`, color of your choice (the bot uses `#d97706` amber by default). Without the label, dedupe still works via the hidden HTML marker in each Issue body, but the per-page query is slower and you cannot filter Issues by `label:autotriage` in the UI.
+
+### Step 3 — `--offline` smoke test
+
+```bash
+appsec-triage --offline
+```
+
+This runs the full Z1 → Z2 → Z3 → Z4 pipeline against the bundled fixtures, with no network and no LLM calls. The expected output ends with `[offline] cycle complete — fast_path=1 continue=2`. If this fails, the install is broken — fix that before touching real credentials.
+
+### Step 4 — Dry-run against a real repo
+
+```bash
+appsec-triage --repo <owner>/<name> --dry-run --sources all
+```
+
+Reads alerts, computes verdicts, and mutates nothing. Look at the output:
+
+- Number of alerts per source in the breakdown line (`[dependabot=N,code_scanning=M,secret_scanning=K]`)
+- The verdict distribution in the summary footer
+- That no `BLOCKED` actions appear (those would indicate a permission gap that the live run will hit)
+
+Adjust the PAT if any source returns 0 alerts unexpectedly, or if `BLOCKED` appears.
+
+### Step 5 — First live run
+
+```bash
+appsec-triage --repo <owner>/<name> --sources all
+```
+
+This creates Issues and posts comments but **does not dismiss any alerts** (no `--auto-transition`). Verify in the GitHub UI:
+
+- One Issue per `(rule_id, file)` for code-scanning, one per `(CVE, package)` for Dependabot — there should be no duplicates
+- The `autotriage` label is applied (assuming you seeded it in Step 2)
+- The hidden marker `<!-- triage:... -->` is present in each Issue body — search for it in the UI to confirm dedupe will work next run
+
+If a verdict on a subsequent run flips relative to the prior one, the bot will **comment** on the existing Issue with the new conclusion. That requires `Issues: Read and write` — confirmed by Step 4's pre-flight check.
+
+### Step 6 — Enable auto-dismiss (optional, only after building trust)
+
+```bash
+appsec-triage --repo <owner>/<name> --sources all --auto-transition
+```
+
+The bot now dismisses Dependabot and Code Scanning alerts judged `false_positive` above the tier's `transition_floor`. **Tier-1 (critical) repos never auto-dismiss**, secret scanning never auto-dismisses, and `tolerable_risk` is never used as a dismiss reason automatically — those are guardrails enforced in code, not flags.
+
+Recommended progression: run with `--auto-transition` on a non-critical repo for two or three cycles. Manually audit the dismissed alerts. If you trust the FPs the bot is closing, expand to more repos.
+
+### Step 7 — Persist `.triage_history.jsonl`
+
+The history file drives the Consistency Gate (anti flip-flop) and the org-wide false-positive consensus check (`≥3 other repos at FP` → skip the Judge). In CI the runner is ephemeral by default, so the file does not survive between runs. Options, in increasing order of robustness:
+
+1. **GitHub Actions artifact** (shipped workflow). Auditable, but downloading + re-uploading on every run is slow once history grows.
+2. **S3 / GCS bucket**. The workflow downloads at cycle start, uploads at cycle end. Standard for production deployments.
+3. **Dedicated state repo** (commit the JSONL on every cycle). Gives you a git history of every triage decision, at the cost of one commit per cycle.
+4. **Private gist**. Lightweight middle ground when you do not want infrastructure but want persistence.
+
+The file is append-only and one JSON object per line — handle it accordingly.
+
+### Step 8 — Schedule
+
+```yaml
+# .github/workflows/triage.yml — daily 04:30 UTC, manual override available
+on:
+  schedule: [{cron: "30 4 * * *"}]
+  workflow_dispatch:
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install -e .
+      - run: appsec-triage --repos org/svc-api,org/svc-web,org/internal --sources all --auto-transition
+        env:
+          GITHUB_TOKEN: ${{ secrets.APPSEC_TRIAGE_PAT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+      - uses: actions/upload-artifact@v4
+        with: { name: triage-history, path: .triage_history.jsonl }
+```
+
+For batches over ~20 repos, switch from `--repos` to a GitHub Actions matrix — one parallel job per repo — to stay under GitHub rate limits on a single PAT.
+
+### Step 9 — Monitor
+
+What to alert on:
+
+- **Exit code != 0**: any non-zero indicates a fetch error (3), auth error (2), or empty input (1). Pipe `appsec-triage … || notify "triage exited $?"` in cron.
+- **`BLOCKED` count > 0** in the summary: PAT permission drift. Re-run the pre-flight check from Step 1.
+- **`needs_review` count keeps growing run-over-run**: the bot is not converging. Either the LLM Judge is being too conservative (raise floors), or your repos have genuinely new findings (expected during a backlog burn-down).
+- **`rotate_now` count > 0**: a secret was leaked. Treat as a paging incident — the bot will create an Issue but cannot rotate the credential for you.
 
 ## Modes (recap)
 
