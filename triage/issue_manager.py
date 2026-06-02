@@ -66,7 +66,24 @@ def marker_for(alert: Alert) -> str:
 
 
 def issue_title(alert: Alert) -> str:
-    cve = alert.cve_id or alert.ghsa_id
+    """Source-aware Issue title.
+
+    For Dependabot the package + CVE is the natural identity. For
+    code-scanning there is no package: the rule_id and the location
+    are the addressable thing (and the alert header in cli output uses
+    the same shape, so reviewers can match Issue to log line at a glance).
+    For secret scanning the secret_type is the only signal we surface; the
+    body adds detail.
+    """
+    if alert.source is AlertSource.CODE_SCANNING:
+        rule = alert.rule_id or "?"
+        path = alert.location_path or "?"
+        if alert.location_line is not None:
+            return f"[triage] {rule} @ {path}:{alert.location_line}"
+        return f"[triage] {rule} @ {path}"
+    if alert.source is AlertSource.SECRET_SCANNING:
+        return f"[triage] secret: {alert.secret_type or 'unknown'}"
+    cve = alert.cve_id or alert.ghsa_id or "?"
     return f"[triage] {alert.package_name} — {cve}"
 
 
