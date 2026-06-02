@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from triage.llm import LLMNotConfigured, chat
 from triage.truth_table import TierClassification
-from triage.types import Alert, EvidenceMatrix, RepoProfile, Verdict, VerdictKind
+from triage.types import Alert, AlertSource, EvidenceMatrix, RepoProfile, Verdict, VerdictKind
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def prosecute(
     is_recomputed: bool = False,
 ) -> ProsecutorResult:
     # Stage 1: deterministic checks.
-    contradictions = _find_contradictions(verdict, evidence)
+    contradictions = _find_contradictions(verdict, evidence, alert)
     if contradictions:
         return ProsecutorResult(
             verdict=_degrade(contradictions),
@@ -123,9 +123,25 @@ def prosecute(
     )
 
 
-def _find_contradictions(v: Verdict, em: EvidenceMatrix) -> list[Contradiction]:
-    """Pure checks. Each rule is one direction only — never propose the opposite verdict."""
+def _find_contradictions(
+    v: Verdict, em: EvidenceMatrix, alert: Alert
+) -> list[Contradiction]:
+    """Pure checks. Each rule is one direction only — never propose the opposite verdict.
+
+    All deterministic rules below reason about *package use* in the default
+    branch (`direct_package_hits`, `vuln_api_hits`, `vuln_apis_seen`). That
+    concept is Dependabot-specific. Code-scanning alerts identify a code
+    location, not a package, and the EvidenceMatrix produced for them is
+    intentionally empty — applying these rules to a code-scanning verdict
+    would, for example, degrade *every* code-scanning `reproducible` to
+    `needs_review` because `direct_package_hits == 0` is always true.
+    The LLM-attack stage (downstream in `prosecute()`) still runs for all
+    sources, so adversarial review is not lost — only the package-use rules
+    are scoped.
+    """
     out: list[Contradiction] = []
+    if alert.source is not AlertSource.DEPENDABOT:
+        return out
     if v.kind is VerdictKind.FALSE_POSITIVE:
         if em.direct_package_hits > 0 and em.vuln_api_hits > 0:
             out.append(Contradiction(
