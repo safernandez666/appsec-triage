@@ -114,11 +114,21 @@ def prosecute(
         )
 
     c = Contradiction(code="llm_attack", why=attack.argument or "LLM attack found an issue")
+    # Recompute only makes sense when there's new evidence to gather. The
+    # online Evidence agent calls `/search/code` only for Dependabot alerts;
+    # for code-scanning and secret-scanning the EvidenceMatrix is constant
+    # by construction (no package, no advisory APIs to extract). Asking for
+    # a recompute on those sources doubles the token spend and produces the
+    # same verdict, then the same LLM-attack contradiction. The decision was
+    # only ever useful for Dependabot.
+    can_recompute = (
+        not is_recomputed and alert.source is AlertSource.DEPENDABOT
+    )
     return ProsecutorResult(
         verdict=_degrade([c]),
         contradictions=(c,),
         attacked_by_llm=True,
-        request_recompute=(not is_recomputed),
+        request_recompute=can_recompute,
         note=f"LLM attack: {c.why[:80]}",
     )
 
