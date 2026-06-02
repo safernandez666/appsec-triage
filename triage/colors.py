@@ -143,17 +143,23 @@ def severity(sev: str) -> str:
 def action(kind: str) -> str:
     """Color an action keyword (CREATE / SKIP / CLOSE / DISMISS).
 
-    Lowercase or uppercase input both accepted. Returns the colored
-    UPPERCASE token so log lines stay uniform.
+    Accepts compound forms emitted by the Issue handler — `create+nodismiss`,
+    `comment+dismissed`, … — and colors by the primary segment so the
+    operator can scan the action column without parsing suffixes. Returns
+    the colored UPPERCASE token verbatim so the operator still sees the
+    full intent (whether a dismiss was attempted, etc.).
     """
     norm = (kind or "").lower()
+    base = norm.split("+", 1)[0]
     upper = kind.upper() if kind else ""
-    if norm == "create":
+    if base == "create":
         return _wrap(upper, BOLD + _Z4)
-    if norm == "dismiss":
+    if base == "comment":
+        return _wrap(upper, _Z4)
+    if base == "dismiss":
         return _wrap(upper, BOLD + _NR)
-    if norm == "close":
+    if base == "close":
         return _wrap(upper, _GRAY)
-    if norm == "skip":
+    if base == "skip":
         return _wrap(upper, _GRAY)
     return upper

@@ -171,13 +171,20 @@ def _tally_verdict(v: Verdict) -> None:
 
 
 def _tally_action(ia: IssueAction) -> None:
-    _ACTION_COUNTS[ia.kind] = _ACTION_COUNTS.get(ia.kind, 0) + 1
+    """Tally compound kinds (`create+dismissed`, `comment+nodismiss`, …)
+    into separate primary and dismiss buckets so the summary stays a
+    flat breakdown instead of a cartesian product."""
+    parts = ia.kind.split("+", 1)
+    primary = parts[0]
+    _ACTION_COUNTS[primary] = _ACTION_COUNTS.get(primary, 0) + 1
+    if len(parts) > 1 and parts[1] == "dismissed":
+        _ACTION_COUNTS["dismiss"] = _ACTION_COUNTS.get("dismiss", 0) + 1
 
 
 def _fmt_summary(prefix: str = "[cycle]") -> str:
     """Render verdict and action counters as two aligned, colored lines."""
     v_order = ("false_positive", "reproducible", "needs_review", "rotate_now")
-    a_order = ("create", "skip", "close", "dismiss")
+    a_order = ("create", "comment", "skip", "close", "dismiss")
     v_parts = [
         f"{n} {col.verdict(k, k, strong=False)}"
         for k in v_order
@@ -590,9 +597,21 @@ def _run_pipeline_once(
         v = judge(a, repo, em, tt.tier)
         _vprint(_fmt_judge_verdict(v))
 
+    # Scope the stage-2 LLM-attack to Dependabot. The Prosecutor prompt asks
+    # the LLM to falsify the verdict from `EvidenceMatrix`, but for
+    # code-scanning and secret-scanning the package-usage and vuln-API fields
+    # are structurally zero (no /search/code is run for those sources). A
+    # diagnostic run against a real repo showed 32/32 code-scanning alerts
+    # contradicted with the identical reason "no direct package usage hits or
+    # vulnerable API usage hits" — the LLM was reasoning about empty fields
+    # that don't apply to its source. Until we ship a code-scanning-aware
+    # Prosecutor prompt (TODO v0.2.2: ask about vendored paths, generated
+    # files, known-FP rule patterns), it is honest to skip rather than
+    # auto-degrade every code-scanning verdict to needs_review on structural
+    # grounds. Critic floor + Consistency Gate still apply.
     pr = prosecute(
         v, a, repo, em, tt.tier,
-        enable_llm_attack=True,
+        enable_llm_attack=(a.source is AlertSource.DEPENDABOT),
         is_recomputed=is_recomputed,
     )
     _vprint(_fmt_prosecutor(pr))
