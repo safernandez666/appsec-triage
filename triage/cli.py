@@ -19,6 +19,7 @@ from pathlib import Path
 
 from triage.advisory_agent import AdvisoryResult, extract_vulnerable_apis
 from triage.banner import print_banner
+from triage import colors as col
 from triage.env_loader import load_dotenv
 from triage.consistency import (
     ConsistencyAction,
@@ -117,8 +118,56 @@ FIXTURES_DIR = _resolve_fixtures_dir()
 HISTORY_PATH = _resolve_history_path()
 
 
-def _fmt_repo(r: RepoProfile) -> str:
+# ---- Summary tally --------------------------------------------------------
+#
+# Module-level mutable counters reset at the start of every `_route_and_print`
+# call. The CLI runs one cycle per process so there is no contention; the
+# tradeoff is one global vs. plumbing a Summary object through five frames.
+# We choose the global for surface-area minimality.
+
+_VERDICT_COUNTS: dict[str, int] = {}
+_ACTION_COUNTS: dict[str, int] = {}
+
+
+def _reset_summary() -> None:
+    _VERDICT_COUNTS.clear()
+    _ACTION_COUNTS.clear()
+
+
+def _tally_verdict(v: Verdict) -> None:
+    _VERDICT_COUNTS[v.kind.value] = _VERDICT_COUNTS.get(v.kind.value, 0) + 1
+
+
+def _tally_action(ia: IssueAction) -> None:
+    _ACTION_COUNTS[ia.kind] = _ACTION_COUNTS.get(ia.kind, 0) + 1
+
+
+def _fmt_summary(prefix: str = "[cycle]") -> str:
+    """Render verdict and action counters as two aligned, colored lines."""
+    v_order = ("false_positive", "reproducible", "needs_review", "rotate_now")
+    a_order = ("create", "skip", "close", "dismiss")
+    v_parts = [
+        f"{n} {col.verdict(k, k, strong=False)}"
+        for k in v_order
+        if (n := _VERDICT_COUNTS.get(k, 0)) or k in _VERDICT_COUNTS
+    ]
+    if not v_parts:
+        v_parts = [f"0 {col.verdict(k, k, strong=False)}" for k in v_order]
+    a_parts = [
+        f"{n} {col.action(k)}"
+        for k in a_order
+        if (n := _ACTION_COUNTS.get(k, 0)) or k in _ACTION_COUNTS
+    ]
+    if not a_parts:
+        a_parts = [f"0 {col.action(k)}" for k in a_order]
     return (
+        f"{prefix} verdicts:  " + " · ".join(v_parts) + "\n"
+        f"{prefix} actions:   " + " · ".join(a_parts)
+    )
+
+
+def _fmt_repo(r: RepoProfile) -> str:
+    return col.dim(
         f"  repo {r.full_name} archived={r.archived} "
         f"language={r.language or '?'} age_days={r.age_days} "
         f"default_branch={r.default_branch}"
@@ -126,34 +175,31 @@ def _fmt_repo(r: RepoProfile) -> str:
 
 
 def _fmt_alert_header(a: Alert) -> str:
-    """v2: source-aware header.
-
-    Dependabot: #N pkg (ecosystem/scope) — CVE severity=X state=Y
-    CodeQL:     #N [code-scanning] rule_id @ path:line — severity=X state=Y
-    Secret:     #N [secret] secret_type — severity=critical state=Y
-    """
+    """v2: source-aware header. Bold + colored severity for fast scanning."""
+    sev = col.severity(a.severity)
+    state = f"state={a.state}"
     if a.source is AlertSource.CODE_SCANNING:
         loc = f"{a.location_path or '?'}:{a.location_line or '?'}"
-        return (
+        head = (
             f"    #{a.number} [code-scanning] {a.rule_id or '?'} @ {loc} "
-            f"— severity={a.severity} state={a.state}"
+            f"—"
         )
+        return f"{col.header(head)} {sev} {state}"
     if a.source is AlertSource.SECRET_SCANNING:
-        return (
-            f"    #{a.number} [secret] {a.secret_type or '?'} "
-            f"— severity={a.severity} state={a.state}"
-        )
-    # Default = Dependabot (matches v1 output verbatim)
+        head = f"    #{a.number} [secret] {a.secret_type or '?'} —"
+        return f"{col.header(head)} {sev} {state}"
+    # Default = Dependabot (semantics match v1; only the rendering is richer)
     cve = a.cve_id or a.ghsa_id or "?"
-    return (
+    head = (
         f"    #{a.number} {a.package_name} ({a.package_ecosystem}/{a.scope}) "
-        f"— {cve} severity={a.severity} state={a.state}"
+        f"— {cve}"
     )
+    return f"{col.header(head)} {sev} {state}"
 
 
 def _fmt_evidence(em: EvidenceMatrix) -> str:
     return (
-        f"      [Z2 evidence] pkg={em.package_name} "
+        f"      {col.z2('[Z2 evidence]')} pkg={em.package_name} "
         f"direct_hits={em.direct_package_hits} "
         f"vuln_api_hits={em.vuln_api_hits} "
         f"vuln_apis_seen={list(em.vuln_apis_seen)} "
@@ -168,7 +214,7 @@ def _fmt_tier(tc: TierClassification) -> str:
         "∞ (guardrail)" if tc.transition_floor == float("inf") else f"{tc.transition_floor:.2f}"
     )
     return (
-        f"      [Z2 tier] {tc.tier.name} "
+        f"      {col.z2('[Z2 tier]')} {tc.tier.name} "
         f"post_floor={tc.post_floor:.2f} transition_floor={transition} "
         f"({tc.reason})"
     )
@@ -176,7 +222,8 @@ def _fmt_tier(tc: TierClassification) -> str:
 
 def _fmt_forced_verdict(v: Verdict) -> str:
     return (
-        f"      [Z2 truth_table: FORCED] verdict={v.kind.value} "
+        f"      {col.ok('[Z2 truth_table: FORCED]')} "
+        f"verdict={col.verdict(v.kind.value)} "
         f"confidence={v.confidence:.2f} source={v.source}\n"
         f"        \"{v.human_conclusion}\""
     )
@@ -184,7 +231,8 @@ def _fmt_forced_verdict(v: Verdict) -> str:
 
 def _fmt_judge_verdict(v: Verdict) -> str:
     return (
-        f"      [Z3 judge] verdict={v.kind.value} "
+        f"      {col.z3('[Z3 judge]')} "
+        f"verdict={col.verdict(v.kind.value)} "
         f"confidence={v.confidence:.2f} source={v.source}\n"
         f"        \"{v.human_conclusion}\""
     )
@@ -195,50 +243,67 @@ def _fmt_prosecutor(pr: ProsecutorResult) -> str:
         codes = [c.code for c in pr.contradictions]
         via = "LLM attack" if pr.attacked_by_llm else "deterministic"
         return (
-            f"      [Z3 prosecutor: CONTRADICTION via {via}] codes={codes} "
-            f"request_recompute={pr.request_recompute}\n"
-            f"        verdict degraded → needs_review (source={pr.verdict.source})"
+            f"      {col.bad(f'[Z3 prosecutor: CONTRADICTION via {via}]')} "
+            f"codes={codes} request_recompute={pr.request_recompute}\n"
+            f"        {col.bad('verdict degraded → needs_review')} "
+            f"(source={pr.verdict.source})"
         )
     stage = "deterministic + LLM attack" if pr.attacked_by_llm else "deterministic only"
-    return f"      [Z3 prosecutor: OK ({stage})] {pr.note}"
+    return f"      {col.dim(f'[Z3 prosecutor: OK ({stage})]')} {col.dim(pr.note)}"
 
 
 def _fmt_critic(before: Verdict, after: Verdict) -> str:
     from triage.types import VerdictKind
     if before.kind is VerdictKind.NEEDS_REVIEW:
-        return "      [Z3 critic: PASS-THROUGH] verdict already needs_review; nothing to degrade"
+        return (
+            f"      {col.dim('[Z3 critic: PASS-THROUGH]')} "
+            f"{col.dim('verdict already needs_review; nothing to degrade')}"
+        )
     if after.source != before.source:
         return (
-            f"      [Z3 critic: DEGRADED] confidence={before.confidence:.2f} below tier floor "
-            f"→ needs_review (source={after.source})"
+            f"      {col.bad('[Z3 critic: DEGRADED]')} confidence={before.confidence:.2f} "
+            f"below tier floor → {col.verdict('needs_review')} (source={after.source})"
         )
-    return f"      [Z3 critic: OK] confidence={before.confidence:.2f} ≥ tier post_floor"
+    return (
+        f"      {col.ok('[Z3 critic: OK]')} "
+        f"confidence={before.confidence:.2f} ≥ tier post_floor"
+    )
 
 
 def _fmt_consistency(d: ConsistencyDecision) -> str:
     prior = "—"
     if d.prior_verdict is not None and d.prior_confidence is not None:
         prior = f"prior={d.prior_verdict} @ {d.prior_confidence:.2f}"
-    return f"      [Z3 consistency: {d.action.value.upper()}] {prior}  reason: {d.reason}"
+    action = d.action.value.upper()
+    # SKIP is the boring case — fade it. POST/GUARD/FIRST are meaningful.
+    tag = f"[Z3 consistency: {action}]"
+    if action == "SKIP":
+        return f"      {col.dim(tag)} {col.dim(prior)}  {col.dim('reason: ' + d.reason)}"
+    return f"      {col.z3(tag)} {prior}  reason: {d.reason}"
 
 
 def _fmt_issue_action(ia: IssueAction) -> str:
     issue = f"#{ia.issue_number}" if ia.issue_number is not None else "—"
-    return f"      [Z4 issue: {ia.kind.upper()}] issue={issue}  {ia.detail}"
+    kind = ia.kind.upper()
+    # SKIP fades; CREATE/CLOSE/DISMISS stay visible.
+    if ia.kind.lower() == "skip":
+        return f"      {col.dim(f'[Z4 issue: {kind}]')} {col.dim(f'issue={issue}  {ia.detail}')}"
+    return f"      {col.z4(f'[Z4 issue: {kind}]')} issue={issue}  {ia.detail}"
 
 
 def _fmt_consensus(c: ConsensusResult) -> str:
     if c.has_consensus:
         return (
-            f"      [Z2 consensus: FOUND] {len(c.fp_repos)} other repos at FP "
+            f"      {col.ok('[Z2 consensus: FOUND]')} {len(c.fp_repos)} other repos at FP "
             f"(avg_conf={c.avg_confidence:.2f}); skipping Judge"
         )
-    return f"      [Z2 consensus: NONE] {c.note}"
+    return f"      {col.dim(f'[Z2 consensus: NONE] {c.note}')}"
 
 
 def _fmt_consensus_verdict(v: Verdict) -> str:
     return (
-        f"      [Z2 consensus: APPLIED] verdict={v.kind.value} "
+        f"      {col.z2('[Z2 consensus: APPLIED]')} "
+        f"verdict={col.verdict(v.kind.value)} "
         f"confidence={v.confidence:.2f} source={v.source}\n"
         f"        \"{v.human_conclusion}\""
     )
@@ -269,6 +334,8 @@ def _route_and_print(
     Returns (fast_path_count, continue_count). `client` is real or offline;
     the pipeline picks the right Evidence backend by isinstance.
     """
+    # NB: counters are NOT reset here — callers reset before invoking so
+    # multi-repo drivers can snapshot per-repo and also tally an aggregate.
     fast = 0
     cont = 0
     for s in sets:
@@ -277,24 +344,25 @@ def _route_and_print(
             print(_fmt_alert_header(a))
             decision = route(a)
             if decision.path is FastPath.CLOSE_ALREADY_RESOLVED:
-                print(f"      [Z1 fast-path: close] {decision.note}")
+                print(f"      {col.z1('[Z1 fast-path: close]')} {decision.note}")
                 ia = handle_fast_path_close(client, s.repo, a, decision.note, flags)
+                _tally_action(ia)
                 print(_fmt_issue_action(ia))
                 fast += 1
                 expected = a.meta.get("expected_verdict")
                 if expected:
-                    print(f"      (fixture expects: {expected})")
+                    print(col.dim(f"      (fixture expects: {expected})"))
                 continue
 
             if a.source is AlertSource.SECRET_SCANNING:
-                print("      [Z1 continue] → Z4 short-circuit (secret scanning)")
+                print(f"      {col.z1('[Z1 continue]')} → Z4 short-circuit (secret scanning)")
             else:
-                print("      [Z1 continue] → Zone 2 investigation")
+                print(f"      {col.z1('[Z1 continue]')} → Zone 2 investigation")
             cont += 1
             _process_alert(a, s.repo, client, flags)
             expected = a.meta.get("expected_verdict")
             if expected:
-                print(f"      (fixture expects: {expected})")
+                print(col.dim(f"      (fixture expects: {expected})"))
     return fast, cont
 
 
@@ -316,7 +384,7 @@ def _process_alert(
         return _process_secret_alert(a, repo, client, flags)
     verdict, want_recompute = _run_pipeline_once(a, repo, client, flags, is_recomputed=False)
     if want_recompute:
-        print("      [Z3 prosecutor] requesting evidence recompute (one-shot allowed)")
+        print(f"      {col.z3('[Z3 prosecutor]')} requesting evidence recompute (one-shot allowed)")
         verdict, _ = _run_pipeline_once(a, repo, client, flags, is_recomputed=True)
     return verdict
 
@@ -328,11 +396,11 @@ def _process_secret_alert(
     flags: CycleFlags,
 ) -> Verdict:
     """Z1 → Z4 short-circuit for secret scanning. No LLM, no judgment."""
-    print("      [Z2 SKIPPED] secret scanning — no investigation, no judgment")
+    print(f"      {col.dim('[Z2 SKIPPED]')} {col.dim('secret scanning — no investigation, no judgment')}")
     v = build_rotate_now_verdict(a)
     print(
-        f"      [Z3 verdict: ROTATE_NOW] confidence={v.confidence:.2f} "
-        f"source={v.source}"
+        f"      {col.verdict('rotate_now', '[Z3 verdict: ROTATE_NOW]')} "
+        f"confidence={v.confidence:.2f} source={v.source}"
     )
     print(f"        \"{v.human_conclusion}\"")
     # Use a synthetic Tier classification at INTERNAL — the secret pipeline
@@ -363,7 +431,7 @@ def _run_pipeline_once(
             em = collect_evidence_online(a, repo, client, advisory_apis=adv.apis)  # type: ignore[arg-type]
         available_str = "yes" if adv.available else "no"
         print(
-            f"      [Z2 advisory{prefix}] llm_available={available_str} "
+            f"      {col.z2(f'[Z2 advisory{prefix}]')} llm_available={available_str} "
             f"apis={list(adv.apis)} ({adv.note})"
         )
         print(_fmt_evidence(em))
@@ -371,12 +439,12 @@ def _run_pipeline_once(
         # CodeQL: the rule.description IS the advisory; no extraction needed.
         # Secret scanning: never reaches here in v2-4+ (Z1 short-circuits).
         print(
-            f"      [Z2 advisory{prefix}] N/A for source={a.source.value} "
+            f"      {col.z2(f'[Z2 advisory{prefix}]')} N/A for source={a.source.value} "
             f"(rule already names the finding)"
         )
         em = empty_evidence_for_non_dependabot(a)
         print(
-            f"      [Z2 evidence] source={a.source.value} "
+            f"      {col.z2('[Z2 evidence]')} source={a.source.value} "
             f"rule={a.rule_id or '—'} "
             f"location={a.location_path or '—'}:{a.location_line or '—'}"
         )
@@ -408,7 +476,7 @@ def _run_pipeline_once(
         v = consensus_verdict(consensus, a)
         print(_fmt_consensus_verdict(v))
     else:
-        print("      [Z2 truth_table] no forced verdict → invoking Final Judge")
+        print(f"      {col.dim('[Z2 truth_table]')} {col.dim('no forced verdict → invoking Final Judge')}")
         v = judge(a, repo, em, tt.tier)
         print(_fmt_judge_verdict(v))
 
@@ -444,6 +512,8 @@ def _finalize(
     append_history(HISTORY_PATH, repo, a, critiqued)
     ia = handle_issue(client, repo, a, critiqued, tier, decision, flags)
     print(_fmt_issue_action(ia))
+    _tally_verdict(critiqued)
+    _tally_action(ia)
     return critiqued
 
 
@@ -475,11 +545,13 @@ def run_offline(flags: CycleFlags | None = None) -> int:
                 f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
                 f"sources={sources_str}}}"
             )
+            _reset_summary()
             fast, cont = _route_and_print(sets, client, flags)
     except Exception as e:
         # Z1 fast-path: fetch (load) failed — error note, no Zone 2/3.
         print(f"[Z1 error note] offline cycle failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 3
+    print(_fmt_summary("[offline]"))
     print(
         f"[offline] cycle complete — "
         f"fast_path={fast} continue={cont}"
@@ -495,6 +567,11 @@ class _RepoResult:
     fast_path: int
     cont: int
     error: str = ""
+    # Snapshot of the global verdict/action counters taken right after the
+    # repo's pipeline finished, before the next repo resets them. Optional
+    # so callers that don't need them (errors before pipeline) can omit.
+    verdict_counts: dict[str, int] | None = None
+    action_counts: dict[str, int] | None = None
 
 
 def _normalize_repo_arg(arg: str) -> str:
@@ -589,8 +666,15 @@ def _process_single_repo_online(
                 f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
                 f"sources={sources_str}}}"
             )
+            _reset_summary()
             fast, cont = _route_and_print(sets, client, flags)
-            return _RepoResult(repo_arg, 0, fast, cont)
+            # Snapshot before any subsequent reset clears globals.
+            v_snap = dict(_VERDICT_COUNTS)
+            a_snap = dict(_ACTION_COUNTS)
+            return _RepoResult(
+                repo_arg, 0, fast, cont,
+                verdict_counts=v_snap, action_counts=a_snap,
+            )
     except Exception as e:
         # Catch-all so one repo crashing inside the pipeline cannot kill a
         # batch of 50. The single-repo path also benefits: any unexpected
@@ -606,6 +690,14 @@ def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
         return 2
     result = _process_single_repo_online(repo_arg, token, flags)
     if result.exit_code == 0:
+        # Restore snapshot so _fmt_summary reads the per-repo numbers.
+        if result.verdict_counts is not None:
+            _VERDICT_COUNTS.clear()
+            _VERDICT_COUNTS.update(result.verdict_counts)
+        if result.action_counts is not None:
+            _ACTION_COUNTS.clear()
+            _ACTION_COUNTS.update(result.action_counts)
+        print(_fmt_summary("[online]"))
         print(
             f"[online] cycle complete — fast_path={result.fast_path} continue={result.cont}"
         )
@@ -640,11 +732,20 @@ def run_online_multi(repos_arg: str, flags: CycleFlags | None = None) -> int:
     ok = sum(1 for r in results if r.exit_code == 0)
     fast_total = sum(r.fast_path for r in results)
     cont_total = sum(r.cont for r in results)
+    # Rebuild aggregate counters so _fmt_summary can color the batch totals.
+    _reset_summary()
     for r in results:
+        if r.verdict_counts:
+            for k, v in r.verdict_counts.items():
+                _VERDICT_COUNTS[k] = _VERDICT_COUNTS.get(k, 0) + v
+        if r.action_counts:
+            for k, v in r.action_counts.items():
+                _ACTION_COUNTS[k] = _ACTION_COUNTS.get(k, 0) + v
         if r.exit_code == 0:
             print(f"  ok    {r.repo}  fast_path={r.fast_path} continue={r.cont}")
         else:
-            print(f"  FAIL  {r.repo}  exit={r.exit_code}  {r.error}")
+            print(f"  {col.bad('FAIL')}  {r.repo}  exit={r.exit_code}  {r.error}")
+    print(_fmt_summary("[online-batch]"))
     print(
         f"[online-batch] complete — {ok}/{len(results)} ok  "
         f"fast_path={fast_total} continue={cont_total}"
