@@ -1,14 +1,14 @@
-# Cómo construí un bot que tría tus alertas de Dependabot (sin dejar que el LLM rompa nada)
+# Cómo construí un bot que tría tus alertas de seguridad (sin dejar que el LLM rompa nada)
 
-> **Estimado de lectura:** ~15 min · **Audiencia:** AppSec, DevSecOps, Platform · **Stack:** Python 3.11, GitHub API, LLM OpenAI-compat
+> **Estimado de lectura:** ~20 min · **Audiencia:** AppSec, DevSecOps, Platform · **Stack:** Python 3.11, GitHub API, LLM OpenAI-compat
 
 En seguridad aplicada hay un problema que conocés muy bien si trabajaste con Dependabot por más de un par de meses: **la fatiga de alertas**. Empezás con tres repos y diez alertas, todo lindo, todo bajo control. Seis meses después tenés 47 repos, 1.200 alertas abiertas, y nadie las mira. El que las mira sabe que la mitad ni siquiera aplica: el paquete está declarado en `requirements-dev.txt` pero no se usa en runtime, o el repo está archivado, o la API vulnerable nunca se invoca desde el código. Pero verificar cada una a mano cuesta media hora. Multiplicalo por 1.200.
 
 Lo que termina pasando es lo peor: el equipo deja de leer las alertas. Y cuando viene la real, también se la pierde.
 
-Yo me cansé y construí algo para resolverlo. Un bot multi-agente que decide por vos cuáles aplican, con justificación en lenguaje plano, sin hacer macanas. Vamos a ver cómo lo armé.
+Yo me cansé y construí algo para resolverlo. Un bot multi-agente que decide por vos cuáles aplican, con justificación en lenguaje plano, sin hacer macanas. Después extendí lo mismo a CodeQL y Secret scanning, porque el problema de fatiga no es solo de dependencias. Vamos a ver cómo lo armé.
 
-> El código está en https://github.com/safernandez666/appsec-triage. Sentite libre de clonarlo y romperlo.
+> El código está en https://github.com/safernandez666/appsec-triage. Está en MIT, sentite libre de clonarlo y romperlo. Hay versión en español del README también.
 
 ---
 
@@ -117,7 +117,7 @@ if verdict.confidence >= tier.transition_floor:
 ```
 
 ```python
-# Capa 2: explicita, segunda línea
+# Capa 2: explícita, segunda línea
 def _maybe_dismiss(...):
     if verdict.kind is not VerdictKind.FALSE_POSITIVE:
         return False, None
@@ -164,42 +164,184 @@ En CI el runner es efímero y el archivo no sobrevive entre runs por default. El
 
 ---
 
+## De Dependabot a tres fuentes (la v0.2.0)
+
+Cuando terminé la v0.1.0 y la dejé andando, salté al siguiente problema obvio: Dependabot no es la única fuente de fatiga. **CodeQL** te tira findings con su propio nivel de ruido (y de falsos positivos cuando la rule se dispara en código de tests o en patrones que en tu contexto son seguros). **Secret scanning** te tira credenciales leakeadas, que ni siquiera son la misma pregunta: no querés saber si "afecta al repo", querés rotar el secreto ya.
+
+Tres fuentes, **tres modelos de riesgo distintos**. Y eso me parece la cosa más interesante que aprendí extendiendo:
+
+💡 No alcanza con tener "un pipeline genérico para alertas de seguridad". Cada signal tiene su propia pregunta. Diseñar un pipeline único que las atienda a todas con la misma lógica sería exactamente el tipo de over-abstraction que termina haciendo más daño que el ruido original.
+
+### Cómo la separación es honesta
+
+Lo primero que toqué fue el tipo `Alert`. Pasó a tener un campo `source` que vale `DEPENDABOT`, `CODE_SCANNING` o `SECRET_SCANNING`, y tres factories distintas:
+
+```python
+@classmethod
+def from_dependabot_payload(cls, payload): ...
+
+@classmethod
+def from_code_scanning_payload(cls, payload): ...
+
+@classmethod
+def from_secret_scanning_payload(cls, payload): ...
+```
+
+La identidad para el Consistency Gate también es source-dependiente, y eso resulta importante:
+
+```python
+@property
+def identity(self) -> str:
+    if self.source is AlertSource.DEPENDABOT:
+        return f"{self.cve_id}::{self.package_ecosystem}::{self.package_name}"
+    if self.source is AlertSource.CODE_SCANNING:
+        return f"{self.rule_id}::{self.location_path}"
+    if self.source is AlertSource.SECRET_SCANNING:
+        return f"{self.secret_type}::{first_commit_sha}"
+```
+
+Para Dependabot, `(CVE+package)` es estable cross-repo y permite consenso org-wide. Para CodeQL, `(rule+path)` es lo más estable que tenés (el mismo rule en el mismo path es probablemente el mismo finding). Para secrets, el `secret_type` más el primer commit donde apareció. Cada uno tiene su propia clave porque **cada uno representa una pregunta distinta sobre el repo**.
+
+Y desde el CLI: `--sources dependabot` (default, para no romper a quien usaba la v0.1.0) o `--sources all` o `--sources codeql,secret` o cualquier combinación.
+
+### CodeQL: misma forma, distinta pregunta
+
+CodeQL pasa por las mismas cuatro zonas que Dependabot, pero con dos cambios importantes:
+
+**Primero**: la pregunta del Judge cambia. Para Dependabot es "¿esta dependencia afecta a este repo?". Para CodeQL es "¿este finding es accionable en este repo?". Los dos prompts son distintos archivos:
+
+```python
+JUDGE_SYSTEM_PROMPT_DEPENDABOT = """..."""
+JUDGE_SYSTEM_PROMPT_CODE_SCANNING = """..."""
+
+def judge(alert, repo, evidence, tier):
+    system_prompt = (
+        JUDGE_SYSTEM_PROMPT_CODE_SCANNING
+        if alert.source is AlertSource.CODE_SCANNING
+        else JUDGE_SYSTEM_PROMPT_DEPENDABOT
+    )
+    ...
+```
+
+Hubiera sido tentador hacer un prompt único "generic security verdict" que sirva para los dos. No. El framing afecta el razonamiento del modelo. Un prompt que dice "decidí si el dependency apply" lleva al modelo a buscar imports. Uno que dice "decidí si el finding es accionable" lleva al modelo a buscar reachability del pattern desde un entry point. Son razonamientos distintos. Mezclarlos en un solo prompt es pedirle al modelo que adivine cuál de los dos estás pidiendo.
+
+**Segundo**: agregué dos rules nuevas a la Truth Table, específicas para CodeQL:
+
+- **Rule C** — Si el `location_path` matchea un directorio de tests (`tests/`, `__tests__/`, `spec/`, `e2e/`, etc.) → `false_positive`. La regex es case-insensitive y matchea en cualquier parte del path. Un finding de SQL injection en `tests/test_queries.py` no es explotable desde runtime; vive en código que solo corre en CI.
+
+- **Rule D** — Si el repo está archivado → `false_positive`. Análoga a Rule A para Dependabot.
+
+Estas rules las hacen exactamente lo mismo que A y B para Dependabot: **resuelven una buena fracción de las alertas sin invocar al LLM**. Y el vocabulario de dismiss que mandamos a la API de CodeQL es distinto al de Dependabot:
+
+```python
+def _dismiss_reason(verdict, alert):
+    if alert.source is AlertSource.CODE_SCANNING:
+        if "codeql_in_tests" in verdict.source:
+            return "used in tests"
+        if "codeql_archived" in verdict.source:
+            return "won't fix"
+        return "false positive"
+    # Dependabot
+    if "no_hits" in verdict.source:
+        return "not_used"
+    return "inaccurate"
+```
+
+GitHub espera literalmente esos strings con esos espacios para la API de code-scanning. Si le mandás `not_used` te da 422. La API es la API; el adapter es del bot, no al revés.
+
+### Secret scanning: modelo de riesgo completamente distinto
+
+Acá es donde más se nota la lección. Para Dependabot y CodeQL las cuatro zonas tienen sentido. Para Secret scanning la pregunta no es "¿es real?" — el secreto está leakeado. La pregunta es "¿está rotado?", y eso solo lo puede contestar un humano que vaya al provider y rote la credencial.
+
+Entonces el pipeline se colapsa:
+
+```
+Z1 routing  →  Z4 output  (sin Z2, sin Z3, sin LLM)
+```
+
+Hay un nuevo `VerdictKind.ROTATE_NOW` que es el único veredicto posible para una alerta de secret. La confianza es 1.0 — y eso es honest, no inventado: no es una decisión probabilística, es estructural. Cada secreto leakeado necesita rotación.
+
+Y el Issue que se abre no es la conclusión típica de Dependabot/CodeQL. Es un template urgente:
+
+```markdown
+# 🔥 ROTATE NOW
+
+A **AWS Access Key ID** was detected in this repository.
+
+**Location:** `scripts/deploy.sh:12` (commit a1b2c3d4…)
+**Alert:** https://github.com/...
+
+## Steps
+
+1. **Rotate the credential at the issuing provider** (cloud console,
+   IdP, service dashboard). Do NOT skip this step — removing it from
+   git history is insufficient because the value may already have been
+   scraped by automated crawlers.
+2. Deploy any service or job that depends on the rotated credential.
+3. Audit access logs for use of the leaked credential between the
+   commit time and the rotation time.
+4. Close this Issue manually once rotation is confirmed.
+```
+
+### Y otra vez "cinturón y tiradores", esta vez para secrets
+
+Acá entra la lección más importante de v0.2.0. **Auto-dismiss de secretos está prohibido**. Punto. ¿Cómo lo enforce?
+
+**Capa 1** — El `GitHubClient` simplemente **no tiene** un método `dismiss_secret_scanning_alert`. Si en algún punto del código alguien intenta llamarlo, no existe. Es `AttributeError` instantáneo.
+
+**Capa 2** — El `_maybe_dismiss` del Issue manager hace este check explícito antes de cualquier otra cosa:
+
+```python
+def _maybe_dismiss(client, repo, alert, verdict, tier, flags):
+    if verdict.kind is not VerdictKind.FALSE_POSITIVE:
+        return False, None
+    if not flags.auto_transition:
+        return False, "--auto-transition off, no dismiss attempted"
+    
+    # v2 GUARDRAIL — Secret scanning is never auto-dismissed. Humans rotate.
+    if alert.source is AlertSource.SECRET_SCANNING:
+        return False, (
+            "GUARDRAIL: secret scanning alerts are never auto-dismissed — "
+            "humans must confirm rotation"
+        )
+    
+    # Continúa con tier-1 guardrail, etc...
+```
+
+**Es exactamente la misma técnica de cinturón y tiradores que usamos para tier-1, aplicada a un problema diferente.** Capa 1 hace imposible la mutación (el método no existe), capa 2 corta antes de llegar (early-return explícito). Si alguien dentro de seis meses por descuido le agrega un `dismiss_secret_scanning_alert` al client, la capa 2 sigue protegiéndolo.
+
+💡 Esto vale la pena internalizarlo: la propiedad "no se puede romper accidentalmente" no es magia. Es **redundancia ortogonal entre capas**. Una capa hace que la operación destructiva no exista; la otra hace que aunque exista no se invoque. Ninguna de las dos solas es suficiente. Las dos juntas, aunque parezcan over-engineering, son lo que hace que el sistema sobreviva los seis meses que faltan para que el próximo dev lea ese código.
+
+---
+
 ## El stack y los números
 
-Quería que el proyecto fuera lo más simple posible. La regla autoimpuesta: **una sola dependencia runtime externa, `httpx`**. Si lo podía hacer con stdlib de Python, lo hacía con stdlib. No hay ORM, no hay framework, no hay SDK de OpenAI — todo va por requests HTTP directos.
+Lo más simple posible. Una sola dependencia runtime externa: `httpx`. Si lo podía hacer con stdlib de Python, lo hacía con stdlib. No hay ORM, no hay framework, no hay SDK de OpenAI — todo va por requests HTTP directos.
 
-Los números finales:
+Los números finales en v0.2.0:
 
-| Métrica | Valor |
-|---|---|
-| Lenguaje | Python 3.11+ |
-| Módulos | 12 (uno por responsabilidad) |
-| LOC totales | ~1.800 |
-| Dependencia runtime | httpx (única) |
-| Empaquetado | pyproject.toml + setuptools |
-| Entry point | `appsec-triage` console script |
-| Workflow CI | GitHub Actions (cron + workflow_dispatch) |
-| Test demo | `appsec-triage --offline` con 3 fixtures |
+| Métrica | v0.1.0 | v0.2.0 |
+|---|---|---|
+| Lenguaje | Python 3.11+ | Python 3.11+ |
+| Módulos | 12 | 13 |
+| LOC totales | ~1.800 | ~3.000 |
+| Dependencia runtime | `httpx` (única) | `httpx` (única) |
+| Fuentes soportadas | Dependabot | Dependabot + CodeQL + Secret |
+| Truth Table rules | 2 (A, B) | 4 (A, B, C, D) |
+| Capas de guardrail tier-1 | 2 | 2 |
+| Capas de guardrail secret no-dismiss | — | 2 |
+| Empaquetado | `pyproject.toml` + setuptools | (igual) |
+| Entry point | `appsec-triage` | (igual) |
 
-Los 12 módulos siguen la división de zonas:
-
-- **Tipos** (`types.py`) — dataclasses frozen, sin lógica.
-- **Cliente** (`github_client.py`) — dos backends (real httpx + offline fixtures) detrás de un Protocol.
-- **LLM** (`llm.py`) — wrapper OpenAI-compat con temperature=0 hardcoded.
-- **Z1** (`routing.py`) — fast-paths.
-- **Z2** (`advisory_agent.py`, `evidence_agent.py`, `truth_table.py`, `memory.py`) — extracción LLM + facts determinísticos + reglas + consenso.
-- **Z3** (`judge.py`, `prosecutor.py`, `critic.py`, `consistency.py`) — juicio + gates de salida.
-- **Z4** (`issue_manager.py`) — side-effects a GitHub + guardrail tier-1.
-
-Cada módulo tiene un docstring arriba que explica qué hace y qué decisiones de diseño tiene. Si te interesa el código, ese docstring es el mejor punto de entrada por archivo.
+Lo que **no** crecí: la dependencia runtime sigue siendo `httpx` solo, el entry point sigue siendo el mismo console script, y `--sources dependabot` (default) sigue produciendo output verbatim al de v0.1.0. Backward compatibility por contrato.
 
 ---
 
 ## Lo que más me sirvió aprender
 
-Si tuviera que quedarme con una sola conclusión del proyecto, es esta:
+Dos lecciones, una por versión.
 
-**La mayoría del valor está fuera del LLM.**
+### Lección de v0.1.0: la mayoría del valor está fuera del LLM
 
 Las reglas determinísticas resuelven la mayoría de los casos correctamente y casi gratis. El LLM aporta donde solo el lenguaje natural puede aportar:
 
@@ -210,40 +352,55 @@ Y nada más.
 
 Si dejás que el LLM decida si una alerta aplica al repo o no, **va a alucinar**. Va a inventar imports que no existen, va a confundir packages parecidos, va a cambiar de opinión entre corridas. Eso no significa que el LLM es inútil — significa que tenés que diseñar el sistema asumiendo que va a alucinar, y poner las decisiones reales en código determinístico que vos podés auditar.
 
-Esto, dicho de otra forma: **el LLM es un componente, no un sistema**. Construir alrededor de esa asimetría es lo que hace confiable un sistema con LLM en producción de seguridad. Si lo ponés en el centro, te termina mordiendo. Si lo ponés en la periferia, donde solo el lenguaje natural lo justifica, te ahorra horas reales sin causar daño.
+### Lección de v0.2.0: el modelo de riesgo manda
 
-💡 Esta lección no es exclusiva de triage de vulnerabilidades. Aplica a cualquier sistema de seguridad con IA: SOC automation, log analysis, threat intel correlation. La parte interesante siempre va a ser **lo que pasa antes y después del LLM**, no el LLM mismo.
+Cuando extendí a CodeQL y Secret scanning, la tentación obvia era "lo mismo pero con otro adapter de entrada". Resistí esa tentación y construí dispatchers en varias capas:
+
+- El `Alert.from_*_payload` por source.
+- El `Alert.identity` por source.
+- El system prompt del Judge por source.
+- El vocabulario de dismiss por source.
+- El pipeline mismo: Dependabot y CodeQL pasan por las cuatro zonas; Secret scanning saltea Z2 y Z3 directo a Z4.
+
+¿Por qué? Porque **cada signal de seguridad responde una pregunta distinta sobre el repo**:
+
+- Dependabot: "¿está esta dependencia siendo usada y la API vulnerable es alcanzable?"
+- CodeQL: "¿esta detección de pattern es accionable en este contexto?"
+- Secret scanning: "¿está rotado?"
+
+Si forzás una pipeline única para los tres, en el mejor caso obtenés un Judge confundido que aluciña más, y en el peor obtenés un bot que cierra automáticamente secrets que están en producción porque "el confidence superó el threshold".
+
+💡 La técnica "belt + suspenders" del tier-1 también se generalizó: dos capas independientes protegen también el no-dismiss de secrets. La técnica no es exclusiva de tier-1; es **el patrón general** para cualquier guardrail no negociable. Una capa estructural (el método no existe, el float es infinito) y una capa explícita (early-return con mensaje claro). Si una de las dos se rompe en el futuro, la otra sigue.
+
+Esto no es exclusivo de triage de vulnerabilidades. Aplica a cualquier sistema de seguridad con IA: SOC automation, log analysis, threat intel correlation. La parte interesante siempre va a ser **lo que pasa antes y después del LLM**, y **cómo diseñás las restricciones que el LLM no puede romper**, no el LLM mismo.
 
 ---
 
 ## Próximos pasos
 
-El bot v1 consume solo alertas de Dependabot. Los dos hooks de extensión más obvios están documentados inline en el código:
+La v0.2.0 cubre las tres fuentes "obvias" de GitHub. Lo que viene después tiene varias direcciones posibles:
 
-- **CodeQL**: extender el GitHubClient con `/code-scanning/alerts`, agregar un `Alert.from_code_scanning_payload` que produzca el mismo shape, reusar todo el pipeline.
-- **Secret scanning**: short-circuit en Z1 — un secreto leakeado es un "rotate now", no es una pregunta de "¿es reproducible?". Modelo de riesgo distinto, no pasa por el Judge.
-
-Y un par de cosas que quedaron como deuda técnica honesta y documentada en el README:
-
-- Persistencia real del historial en CI (hoy es artifact-only).
-- Adapter para LLMs no-OpenAI-compatible.
-- Particionado del archivo de historial cuando tu "org" tiene subgrupos con posturas de riesgo distintas.
+- **Persistencia real del historial en CI**. Hoy es artifact-only. En producción lo persistís en S3, un gist privado o un repo dedicado de estado. Lo dejo documentado en el README.
+- **Otras fuentes de seguridad de GitHub**: la Dependency Review API en PR time (para bloquear merges con vulns sin tener que esperar al cron de Dependabot), supply chain attestations (cuando GitHub lo expanda a más ecosistemas), y eventualmente telemetría de runtime cuando exista una API estable.
+- **Adapter para otros LLMs**. Hoy asumo OpenAI-compatible. Bedrock InvokeModel, raw Anthropic API, o modelos self-hosted necesitan un adapter delgado. No es difícil, solo no estaba en scope.
+- **Métricas reales después de correrlo unos meses**. Cuántas alertas resuelve sin LLM (Truth Table). Cuántas resuelve por consenso. Cuántas terminan en `needs_review` y por qué. Tasa de revocación del Prosecutor. Eso es contenido para un Part 3 cuando tenga data.
 
 Si querés probarlo en tu propio repo, el README tiene un quick start de tres comandos:
 
 ```bash
 pip install -e .
 cp .env.example .env       # poné tu PAT + LLM_API_KEY
-appsec-triage --repo owner/name --dry-run
+appsec-triage --repo owner/name --dry-run --sources all
 ```
 
-Y si te animás al `--auto-transition`, el guardrail tier-1 está ahí para vos.
+Y si te animás al `--auto-transition`, los guardrails tier-1 + secret-no-dismiss están ahí para vos.
 
-Seguiremos explorando esto en próximas entregas — me interesa especialmente meterle CodeQL en serio, y compartir las métricas reales después de un par de meses corriéndolo en producción.
+Seguiremos explorando esto en próximas entregas. Para mí lo más interesante del proyecto sigue siendo **la asimetría LLM/determinístico**, y cada extensión nueva la hace más evidente. Le estoy tomando el gusto.
 
-¡Listo! Espero que les sirva. Si lo levantan en su propio entorno, contame qué encontraron.
+¡Listo! Espero que les sirva. Si lo levantan en su propio entorno, contame qué encontraron — sobre todo el ratio de alertas que terminan resueltas sin LLM en su org, que ese número es el que más me interesa saber.
 
 ---
 
 > **Código:** https://github.com/safernandez666/appsec-triage
 > **Licencia:** MIT. Auditá antes de producción.
+> **Releases:** https://github.com/safernandez666/appsec-triage/releases
