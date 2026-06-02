@@ -47,9 +47,10 @@ class ProsecutorResult:
 
 
 PROSECUTOR_SYSTEM_PROMPT = """You are an adversarial reviewer of an AppSec triage \
-verdict. You will be shown a verdict and the evidence that produced it. Your job is \
-to try to FALSIFY the verdict using only the evidence provided — you are explicitly \
-looking for a reason the verdict is wrong.
+verdict on a DEPENDABOT (vulnerable dependency) finding. You will be shown a \
+verdict and the evidence that produced it. Your job is to try to FALSIFY the \
+verdict using only the evidence provided — you are explicitly looking for a \
+reason the verdict is wrong.
 
 Output strict JSON only, no prose around it:
 {"found_issue": <true|false>, "argument": "<plain English, 1-2 sentences>"}
@@ -62,6 +63,38 @@ Rules:
 - The "argument" must not mention agent names, scores, or first-person voice.
 - Reason only from the evidence provided. Do not invent imports, code paths,
   or APIs that are not listed."""
+
+
+PROSECUTOR_SYSTEM_PROMPT_CODE_SCANNING = """You are an adversarial reviewer of an \
+AppSec triage verdict on a CODE SCANNING finding (CodeQL or other SAST). You will \
+be shown the rule_id, the file path + line, and the verdict reasoning. Your job \
+is to try to FALSIFY the verdict — find a CONCRETE reason it is wrong.
+
+Output strict JSON only, no prose around it:
+{"found_issue": <true|false>, "argument": "<plain English, 1-2 sentences>"}
+
+Rules:
+- "found_issue": true only when you can show a CONCRETE reason the verdict is
+  wrong. Vague unease ("might not be exploitable") is not enough.
+- DO NOT use "no reachability evidence" or "absence of package usage" as an
+  argument. Code-scanning findings have no package — that line of reasoning is
+  structurally meaningless for this source.
+- Legitimate attack angles (use these when applicable):
+  * VENDORED THIRD-PARTY code paths: `/node_modules/`, `/vendor/`,
+    `/third_party/`, `/dist/`, `/build/`, files ending in `.min.js`,
+    bundled libraries like `bootstrap-*.js`, `jquery-*.js`, `lodash-*.js`.
+    The repo did not author this code, so a `reproducible` verdict on
+    library internals is often a vendor-side issue, not application risk.
+  * GENERATED or COMPILED output: `.min.`, `.bundle.`, sourcemap-adjacent
+    files, anything obviously machine-emitted.
+  * The rule_id is one known for high false-positive rates on library
+    code (e.g. `js/xss-through-dom` against any DOM-manipulation library
+    that uses `.html()` legitimately).
+  * The verdict's stated reasoning is internally inconsistent with the
+    file path or rule shown.
+- If none of these apply and you cannot falsify the verdict, set
+  "found_issue": false and "argument": "".
+- The "argument" must not mention agent names, scores, or first-person voice."""
 
 
 def prosecute(
@@ -222,11 +255,22 @@ def _llm_attack(
     em: EvidenceMatrix,
     tier: TierClassification,
 ) -> _LLMAttack | None:
+    # Dispatch system prompt + user payload by source. The Dependabot
+    # prompt reasons about package usage and advisory APIs; that frame
+    # is structurally empty for code-scanning, so a different prompt
+    # asks for a different class of contradiction (vendored paths,
+    # generated files, rule_id false-positive patterns).
+    if alert.source is AlertSource.CODE_SCANNING:
+        system_prompt = PROSECUTOR_SYSTEM_PROMPT_CODE_SCANNING
+        user_payload = _build_attack_payload_code_scanning(verdict, alert, repo, tier)
+    else:
+        system_prompt = PROSECUTOR_SYSTEM_PROMPT
+        user_payload = _build_attack_payload(verdict, alert, repo, em, tier)
     try:
         raw = chat(
             messages=[
-                {"role": "system", "content": PROSECUTOR_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_attack_payload(verdict, alert, repo, em, tier)},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_payload},
             ],
             response_format={"type": "json_object"},
         )
@@ -281,4 +325,39 @@ def _build_attack_payload(
         f"  manifest present: {em.has_manifest}\n"
         f"  lockfile present: {em.has_lockfile}\n"
         f"  Dockerfile present: {em.has_dockerfile}\n"
+    )
+
+
+def _build_attack_payload_code_scanning(
+    verdict: Verdict,
+    alert: Alert,
+    repo: RepoProfile,
+    tier: TierClassification,
+) -> str:
+    """Code-scanning-specific payload.
+
+    Deliberately omits Dependabot-only fields (package, advisory APIs,
+    /search/code hit counts) — keeping them around just confuses the
+    LLM into using "all zero" as a contradiction. Includes the path
+    prominently because that's where most legitimate FP attacks come
+    from (vendored libraries, generated files).
+    """
+    loc = f"{alert.location_path or '?'}"
+    if alert.location_line is not None:
+        loc = f"{loc}:{alert.location_line}"
+    return (
+        f"VERDICT TO ATTACK: {verdict.kind.value}\n"
+        f"Stated conclusion: {verdict.human_conclusion}\n"
+        f"\n"
+        f"Rule: {alert.rule_id or '?'}\n"
+        f"Location: {loc}\n"
+        f"Severity: {alert.severity}\n"
+        f"Summary: {alert.summary}\n"
+        f"Description:\n{alert.description}\n"
+        f"\n"
+        f"Repository: {repo.full_name}\n"
+        f"  default branch: {repo.default_branch}\n"
+        f"  language: {repo.language or 'unknown'}\n"
+        f"  archived: {repo.archived}\n"
+        f"  tier: {tier.tier.name.lower()}\n"
     )
