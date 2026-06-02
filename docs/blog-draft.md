@@ -366,6 +366,117 @@ Y el detalle que más me importa: **los guardrails tier-1 se evalúan por repo d
 
 ---
 
+## La v0.2.1 conoce un repo de verdad
+
+Hasta acá todo era teoría con fixtures. La primera corrida contra un repo real (`safernandez666/Controls`, 38 alertas: 6 Dependabot + 32 CodeQL) destapó tres bugs que ningún test offline iba a encontrar — y la forma en que aparecieron es la mejor parte del proyecto.
+
+### Bug 1 — El Prosecutor se acordaba de algo que no existía
+
+Primera corrida live, summary:
+
+```
+[online] verdicts:  4 false_positive · 0 reproducible · 34 needs_review
+```
+
+**Cero reproducibles**. De 32 alertas de XSS-through-DOM en código de producción, **ninguna** "es accionable". Algo está mal. Los XSS son reales, los podés ver con tus propios ojos en el código de Bootstrap embebido del repo.
+
+Investigué con el modo verbose (que tuve que agregar a mitad del debug, primer aprendizaje: **siempre hacé el output del bot tunable**, debug-level por default es un anti-patrón). Lo que encontré: el LLM-Prosecutor estaba atacando 32/32 alertas de code-scanning con **literalmente el mismo argumento**:
+
+> "The evidence indicates that there are no direct package usage hits or vulnerable API usage hits, suggesting that the identified issue may not be exploitable in the current context."
+
+Repetido 32 veces, palabra por palabra (bueno, con variaciones menores — `temperature=0` no es estrictamente determinista).
+
+El problema: el Prosecutor recibe el `EvidenceMatrix` y le pregunta al LLM "¿podés contradecir el verdict del Judge?". El `EvidenceMatrix` tiene campos como `direct_package_hits`, `vuln_api_hits`, `vuln_apis_seen`. Esos campos están **definidos para Dependabot** — son el resultado de `/search/code` contra el `package_name` del advisory. Para code-scanning, **no hay paquete que buscar**. La alerta apunta a una línea de código, no a una dependencia. Esos campos siempre son cero por construcción.
+
+Y el LLM, viendo "todos los campos en cero", concluye "no hay evidencia de que el código sea alcanzable" → contradicción → degrada a `needs_review`.
+
+**Es el mismo error que ya había arreglado en la capa determinística** (el `repro_but_no_pkg_use` rule scopeado a Dependabot solo). Ese fix lo había hecho antes en este mismo cycle. Pero el LLM-Prosecutor en la segunda capa estaba haciendo lo mismo, en lenguaje natural, sin que yo lo viera. **El bug se mudó de capa.**
+
+Fix: scope el stage 2 del Prosecutor (LLM-attack) también a Dependabot. Para code-scanning queda el Judge + Critic + Consistency, sin LLM adversarial.
+
+Después del fix:
+
+```
+[online] verdicts:  4 false_positive · 25 reproducible · 9 needs_review
+```
+
+**25 XSS reproducibles** aparecieron de la nada — no aparecieron, *siempre estuvieron ahí*. El bot las estaba clasificando correctamente como `reproducible` y después una segunda capa las suprimía silenciosamente. Los 9 `needs_review` que quedaron son legítimos: alertas de `js/unsafe-jquery-plugin` donde el Judge mismo dijo "confidence 0.50, no estoy seguro." Eso sí merece revisión humana.
+
+💡 La lección general: **cuando agregás un step adversarial, asegurate que pueda razonar con la evidencia que recibe**. Pedirle a un LLM que falsifique un verdict basándose en campos que no aplican a la fuente garantiza que va a falsificar todo lo que se le ponga adelante. No es que el LLM esté siendo conservador — está siendo *estructuralmente vacío*.
+
+### Bug 2 — El `--dry-run` envenenaba el archivo de history
+
+Después del primer fix de prosecutor, esperaba 25 Issues creadas. La corrida live mostró **2**.
+
+Resulta que el Consistency Gate del bot evita postear Issues duplicadas leyendo `.triage_history.jsonl` — si la última entry para `(repo, alert_identity)` tiene el mismo verdict, skip. Bueno. Pero **mi `_finalize` siempre escribía al history**, sin importar si era dry-run o no. Los varios `--dry-run` que había corrido para iterar ya habían registrado todas las XSS como `needs_review` o `reproducible`. Cuando finalmente corrí live, el Consistency Gate vio "ya lo procesé" → SKIP → no creó nada.
+
+El bot pensaba que ya había hecho el triage. Pero **nunca había creado las Issues**.
+
+Fix:
+
+```python
+if not flags.dry_run:
+    append_history(HISTORY_PATH, repo, a, critiqued)
+```
+
+Una línea. Pero el bug es bonito porque demuestra una clase entera de errores: **mutaciones laterales que no respetan el switch principal**. Si tu programa tiene un modo "no muta nada", tenés que listar **todas** las cosas que muta y gatearlas. Es fácil olvidarse del archivo de history porque "es solo un log."
+
+💡 Lección: **dry-run debe ser pure**. Ningún state visible al programa puede cambiar. Si hay duda, hay bug.
+
+### Bug 3 — La label silenciosamente nunca existió
+
+Tercera corrida (después de los dos fixes anteriores y de limpiar el history): 12 Issues creadas. Bueno. Pero al mirarlas en GitHub:
+
+```
+#1  [—]  [triage] jquery — CVE-2019-11358
+#2  [—]  [triage] jquery — CVE-2019-11358
+#3  [—]  [triage] jquery — CVE-2019-11358
+#4  [—]  [triage] jquery — CVE-2019-11358
+```
+
+**Cuatro duplicados del mismo CVE**. Y la columna de labels vacía en todas. El bot pasa `labels=["autotriage"]` al endpoint de create_issue. Pero la columna está vacía. Qué pasa.
+
+Lo que pasa: GitHub silenciosamente droppea labels que no existen en el repo. Si la label `autotriage` no existe (y no existía, era un repo fresh), el create succeed pero **sin la label**. Después, mi `_find_existing` filtra por `label=autotriage` para buscar Issues existentes con el mismo marker HTML. Como ninguna Issue tiene esa label (¡fueron creadas sin ella!), `_find_existing` devuelve `None`, y **cada create produce una Issue nueva**. Dedupe roto en cascada.
+
+Fix doble: crear la label idempotente al inicio del cycle (`ensure_label`, ignora 422 "ya existe"), Y hacer que `_find_existing` caiga a un fallback que busca *en todas las open Issues sin filtro de label*. El marker HTML es único por alert identity, así que match falso es estructuralmente imposible.
+
+💡 Lección: **no asumas que la entrada de un API tiene los efectos que prometí**. La API de GitHub no te dice "ignoré la label porque no existe" — te devuelve 201 Created y un Issue feliz. Tu código no sabe que algo no se aplicó. Es por eso que el `_find_existing` ahora tiene fallback: cuando una pieza del sistema depende de un side-effect de otra parte, defendete contra el caso en que el side-effect silenciosamente no ocurrió.
+
+### Bonus — El PAT permite crear Issues pero no comentar
+
+Cuarta corrida, después de borrar las dups y los dos fixes anteriores. Esperaba 11 Issues + 1 comment (un verdict-flip de un FP de Dependabot). Resultado: 11 Issues, 0 comments, 1 acción marcada `BLOCKED`. Logs:
+
+> `403 Forbidden — "Resource not accessible by personal access token"` en `POST /repos/.../issues/{n}/comments`
+
+Mi PAT podía CREATE Issues pero no COMMENT. Eso es objetivamente raro porque en fine-grained PATs ambos están bajo `Issues: Read and write`. Sospecho que cuando creé el token marqué un sub-permiso restringido. La UI de GitHub para PATs fine-grained es confusa con eso.
+
+Fix por dos lados: en el código, wrappeé create + comment en try/except — un 403 ya no aborta todo el ciclo, marca la acción como `BLOCKED`, sigue. Y en el PAT, subir el Issues a Read and write resolvió el 403.
+
+💡 Lección: **los permisos del PAT no son auditables fácilmente**. La forma de saber si el PAT puede hacer X es intentar hacer X y ver qué responde. El bot ahora hace un pre-flight check documentado en el README — un POST de prueba a un endpoint conocido — y un soft-fail con visibilidad cuando el permiso falla en producción.
+
+### El número final
+
+Despues de los cuatro fixes, contra el mismo repo, mismo `--sources all`:
+
+```
+[online] verdicts:  4 false_positive · 25 reproducible · 9 needs_review
+[online] actions:   11 CREATE · 26 SKIP · 1 BLOCKED  ← antes del fix de PAT
+[online] actions:   2 COMMENT · 36 SKIP             ← después del fix de PAT, en la siguiente corrida
+```
+
+11 Issues sin duplicados, una label aplicada (después de crearla a mano), verdict-flips comentando los Issues existentes. **Eso es un bot productivo.**
+
+> 💡 Y la lección meta más importante: **los tests offline con fixtures son una condición necesaria pero no suficiente**. Toda la suite del proyecto pasaba antes de la primera corrida real. Los cuatro bugs estaban escondidos en interacciones que las fixtures no podían modelar:
+>
+> - El Prosecutor LLM era no-determinístico en su falla (32/32 dijo "no reachability" pero ningún test lo capturaba)
+> - El history pollution requiere dos corridas seguidas para manifestarse (offline solo corre una)
+> - La label de GitHub solo se manifiesta contra el API real
+> - Los permisos del PAT son inauditables sin tocar el API real
+>
+> El plan que terminó funcionando — y que ahora está en el README como guía de producción — es **9 pasos crecientes**: offline smoke → dry-run contra un repo → primera live sin auto-dismiss → habilitar auto-dismiss después de generar confianza. Cada paso destapa una clase de bugs que el anterior no podía destapar.
+
+---
+
 ## Lo que más me sirvió aprender
 
 Dos lecciones, una por versión.
@@ -403,16 +514,30 @@ Si forzás una pipeline única para los tres, en el mejor caso obtenés un Judge
 
 Esto no es exclusivo de triage de vulnerabilidades. Aplica a cualquier sistema de seguridad con IA: SOC automation, log analysis, threat intel correlation. La parte interesante siempre va a ser **lo que pasa antes y después del LLM**, y **cómo diseñás las restricciones que el LLM no puede romper**, no el LLM mismo.
 
+### Lección de v0.2.1: la realidad audita los assumptions que las fixtures no pueden
+
+Los cuatro bugs del primer rollout real tienen una cosa en común: **eran invisibles offline**. La suite de tests pasaba, las fixtures se comportaban. El bot creía que estaba listo. Pero entre el último test offline y la primera corrida productiva hay una capa entera de cosas que no podés simular:
+
+- Cómo razona un LLM real con prompt + evidencia *no preparada para él* (el Prosecutor sobre code-scanning).
+- Cómo se comportan los archivos persistentes entre invocaciones (el history pollution).
+- Qué hace silenciosamente una API externa cuando le mandás algo que no entiende (la label droppeada).
+- Qué permisos *en realidad* tiene tu PAT vs. los que la UI dice (el 403 en comments).
+
+Cada uno de esos requiere fricción real para aparecer. La conclusión de diseño que saqué: **el camino del PoC a producción no es "agregar más tests" — es ejercitar la cosa contra realidad lo más temprano posible, con la postura de pre-mortem**. La guía de 9 pasos en el README es exactamente eso: cada paso es un sandbox un poquito más cerca de producción que el anterior, y cada paso destapa una clase de bugs que el anterior no podía.
+
+El bot tiene ~3.000 líneas de código y la mayoría del valor de los últimos commits no es código nuevo — es **cosas que el bot tiene que respetar para no romper en producción**. Soft-fail en lugar de hard-crash, labels idempotentes, dry-run que es realmente dry, output condensado en lugar de un walltext de debug. Producción es una conversación distinta a "¿el algoritmo funciona?".
+
 ---
 
 ## Próximos pasos
 
-La v0.2.0 cubrió las tres fuentes "obvias" de GitHub; la v0.2.1 cubrió el primer paso hacia operar más de un repo a la vez. Lo que viene después tiene varias direcciones posibles:
+La v0.2.0 cubrió las tres fuentes "obvias" de GitHub; la v0.2.1 cubrió el primer paso hacia operar más de un repo a la vez **y la fricción de poner el bot en producción real**. Lo que viene en v0.2.2 y más allá:
 
-- **Persistencia real del historial en CI**. Hoy es artifact-only. En producción lo persistís en S3, un gist privado o un repo dedicado de estado. Lo dejo documentado en el README.
+- **Prosecutor LLM consciente de code-scanning**. Hoy desactivado para esa fuente porque el prompt razona sobre evidencia de paquete que no aplica. Un prompt nuevo le preguntaría al LLM por vendored paths (`node_modules/`, `vendor/`, `*.min.js`, `bootstrap*`), archivos generados, y rules con falsos positivos conocidos. Recupera la revisión adversarial sin la trampa estructural.
+- **Tier overrides por archivo de config**. Hoy el tier se infiere automáticamente del perfil del repo. Un `.appsec-triage.yml` simple por repo o por org permitiría declarar `org/payments-api: critical`, `org/internal-tool: internal`. Más predictable que las heurísticas.
+- **Persistencia real del historial en CI**. Hoy es artifact-only. En producción lo persistís en S3, un gist privado o un repo dedicado de estado. Documentado en el README como paso 7 de la guía de producción.
 - **Otras fuentes de seguridad de GitHub**: la Dependency Review API en PR time (para bloquear merges con vulns sin tener que esperar al cron de Dependabot), supply chain attestations (cuando GitHub lo expanda a más ecosistemas), y eventualmente telemetría de runtime cuando exista una API estable.
 - **Adapter para otros LLMs**. Hoy asumo OpenAI-compatible. Bedrock InvokeModel, raw Anthropic API, o modelos self-hosted necesitan un adapter delgado. No es difícil, solo no estaba en scope.
-- **Config por archivo para flotas grandes**. El modo batch actual escala bien hasta ~20 repos con una lista comma-separated; más allá de eso lo correcto es un YAML por repo con sus tiers, fuentes, y overrides. Es trabajo, pero es claro.
 - **Métricas reales después de correrlo unos meses**. Cuántas alertas resuelve sin LLM (Truth Table). Cuántas resuelve por consenso. Cuántas terminan en `needs_review` y por qué. Tasa de revocación del Prosecutor. Eso es contenido para un Part 3 cuando tenga data.
 
 Si querés probarlo en tu propio repo, el README tiene un quick start de tres comandos:
@@ -440,3 +565,4 @@ Seguiremos explorando esto en próximas entregas. Para mí lo más interesante d
 > **Código:** https://github.com/safernandez666/appsec-triage
 > **Licencia:** MIT. Auditá antes de producción.
 > **Releases:** https://github.com/safernandez666/appsec-triage/releases
+> **Versión actual:** [v0.2.1](https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1)

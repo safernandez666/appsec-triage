@@ -3,35 +3,37 @@
 **Cover image:** `docs/blog-cover.png` (1600×840 PNG, ya commiteado en el repo).
 **Length:** ~1700 chars (entra sin "ver más" en mobile).
 **Cierre con pregunta** → engagement hook para LinkedIn.
+**Release:** https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1
 
-> **Nota:** Esto reemplaza al teaser de v0.2.0. La narrativa de v0.2.0 (tres fuentes, LLM sandwicheado, guardrails con belt + suspenders) sigue intacta — la novedad de v0.2.1 es **operacional**: pasar de "un repo" a "una flota chica" sin perder los guardrails.
+> **Nota:** Esto reemplaza al teaser de v0.2.0. El "qué hace el bot" sigue siendo la misma historia (tres fuentes, LLM sandwicheado, guardrails con belt + suspenders). Lo nuevo de v0.2.1 es **operacional**: cómo pasar de un PoC que funciona con fixtures a un bot que efectivamente labura en un repo real, y la lista de bugs que solo aparecieron en la primera corrida productiva.
 
 ---
 
 ## Versión principal (ES) — copy-paste
 
-> **v0.2.1 del bot que tría tus alertas de Dependabot, CodeQL y Secret scanning está vivo.**
+> **v0.2.1 del bot multi-agente de triage de Dependabot + CodeQL + Secret scanning está vivo, y por primera vez está corriendo contra un repo real.**
 >
-> La v0.2.0 le enseñó al bot a leer tres fuentes de seguridad de GitHub. La v0.2.1 le enseñó a correr contra una flota chica sin perder los guardrails. Un flag nuevo: `--repos org/a,org/b,org/c`.
+> Lo que prometía la v0.2.0 — el LLM nunca actúa solo, sandwicheado entre dos capas determinísticas — terminó pasando un test mucho más duro que mis fixtures: 38 alertas reales, 32 CodeQL XSS + 6 Dependabot, en un repo con Bootstrap vendored adentro.
 >
-> Tres cosas que el modo batch hace y un loop de bash con `set -e` no:
+> Primera corrida: 0 reproducibles, 34 needs_review. El LLM-Prosecutor estaba atacando 32/32 alertas de code-scanning con el mismo argumento: "no direct package usage hits or vulnerable API usage hits." Repetido textual 32 veces. Bug estructural — el Prosecutor recibe un EvidenceMatrix que solo tiene datos cuando la fuente es Dependabot. Para code-scanning todos los campos son cero por construcción, y el LLM concluye "no explotable" sobre nada.
 >
-> 1️⃣ Error isolation. Cada repo se procesa en un helper que **nunca lanza excepciones** — fallas de auth, fetch errors, crashes inesperados se atrapan, se registran con su exit code, y el batch sigue con el próximo. Un repo que se rompe no aborta los otros cuarenta y nueve. El camino single-repo `--repo` ahora comparte el mismo helper.
+> Mismo bug que ya había arreglado en la capa determinística. Se mudó de capa. Lección: **cuando agregás un step adversarial con LLM, asegurate que pueda razonar con la evidencia que recibe.** Pedirle que falsifique un verdict basándose en campos que no aplican garantiza que va a falsificar todo.
 >
-> 2️⃣ Resumen por repo al final. `ok` / `FAIL` por repo con fast-path count, continue count, y el mensaje de error cuando aplica. Auditeable en un `cron` log sin scrollear miles de líneas.
+> Otros bugs que solo aparecieron en producción:
 >
-> 3️⃣ Exit code honesto. El batch retorna el peor exit code visto — si tres de cincuenta repos fallaron, `cron` lo detecta. Nada de que el último repo salga ok y se trague la falla parcial.
+> — `--dry-run` envenenaba el `.triage_history.jsonl`. El "modo no muta nada" tiene que listar TODAS las cosas que muta. Fácil olvidarse del archivo de history porque "es solo un log".
 >
-> Lo que **no** hace, a propósito: no es paralelo (los rate limits de GitHub sobre un PAT lo hacen foot-gun), no acepta config por archivo (si tu flota necesita YAML, ya superaste este modo), no permite `--sources` por repo (las fuentes son globales al batch).
+> — La label `autotriage` no existía en el repo, GitHub la droppeó silenciosamente, el dedupe basado en label dejó de funcionar. Cada CREATE creaba duplicados. Las APIs externas hacen cosas silenciosas — defendete contra side-effects que no ocurrieron.
 >
-> Y lo importante: **los guardrails tier-1 se evalúan por repo dentro del batch**. Un repo crítico adentro de un batch de cincuenta sigue sin ser auto-dismisseado. El `transition_floor = inf` + early return explícito del tier-1, y el "secret-scanning no tiene método dismiss en el client" — todo intacto, todo aplica por repo.
+> — Mi PAT podía CREATE Issues pero NO COMMENT (403). Los permisos de PATs fine-grained son inauditables sin pegarle al API. Ahora el bot tiene un pre-flight check documentado y soft-fail con visibilidad.
 >
-> Stack: Python 3.11, una sola dependencia runtime (`httpx`), GitHub Actions cron + `workflow_dispatch`. README EN y ES. Modo `--offline` con fixtures para probarlo sin gastar tokens.
+> Después de los cuatro fixes: 11 Issues sin duplicados, 25 XSS reproducibles correctamente clasificadas, 4 false positives auto-archivables, 9 needs_review legítimos. **Eso sí es un bot productivo.**
 >
-> Código: https://github.com/safernandez666/appsec-triage
-> Blog post completo: en breve.
+> El README ahora tiene una guía de 9 pasos para llevarlo a producción — cada paso es un sandbox un poquito más cerca del real, cada uno destapa una clase de bugs que el anterior no podía.
 >
-> Cuando armás un wrapper de batch sobre un pipeline existente, ¿lo hacés wrappear la función single o reescribís la lógica adentro del loop?
+> https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1
+>
+> ¿Cuál fue tu bug "que solo aparece en producción" más memorable? Yo me llevo el del Prosecutor de hoy.
 >
 > #AppSec #SecurityEngineering #LLM #OpenSource
 
@@ -39,19 +41,25 @@
 
 ## Versión corta (~900 chars) — si tu feed prefiere posts breves
 
-> **v0.2.1 vivo.** El bot multi-agente que tría Dependabot + CodeQL + Secret scanning ahora corre contra una flota: `--repos org/a,org/b,org/c`.
+> **v0.2.1 vivo, primera corrida real contra un repo de verdad.**
 >
-> Tres cosas que el modo batch hace y un loop de bash con `set -e` no:
+> La suite offline pasaba. La fixture estaba feliz. La primera corrida live destapó cuatro bugs invisibles ante tests:
 >
-> — Error isolation. Cada repo se procesa en un helper que **nunca lanza**. Un repo roto no aborta los demás.
-> — Resumen por repo al final (`ok` / `FAIL` + counts + error). Auditeable en un cron log.
-> — Exit code honesto. El batch retorna el peor exit code visto — `cron` detecta fallas parciales.
+> — El LLM-Prosecutor atacaba 32/32 code-scanning alerts con la misma razón. Razonaba sobre evidencia que no aplicaba a esa fuente.
 >
-> Los guardrails tier-1 se evalúan **por repo dentro del batch**. Un crítico adentro de un batch de cincuenta sigue sin ser auto-dismisseado.
+> — `--dry-run` escribía al history. Las rehearsals envenenaban las corridas live posteriores.
 >
-> https://github.com/safernandez666/appsec-triage
+> — La label inexistente rompía el dedupe silenciosamente. 4 duplicados de la misma CVE.
 >
-> Cuando wrappeás un pipeline existente con batch mode, ¿reusás la función single o reescribís la lógica?
+> — Mi PAT podía CREATE Issues pero no COMMENT. 403 silencioso, ciclo entero abortado.
+>
+> Lección general: **el camino del PoC a producción no es "más tests" — es ejercitar contra realidad lo antes posible, con postura de pre-mortem.**
+>
+> Guía de 9 pasos en el README ahora.
+>
+> https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1
+>
+> ¿Tu bug favorito "solo aparece en producción"?
 >
 > #AppSec #LLM #OpenSource
 
@@ -59,28 +67,29 @@
 
 ## Versión en inglés — para alcance internacional
 
-> **v0.2.1 of the bot that triages your Dependabot, CodeQL, and Secret scanning alerts is live.**
+> **v0.2.1 of the multi-agent Dependabot + CodeQL + Secret scanning triage bot is out — and for the first time, it ran against a real repo.**
 >
-> v0.2.0 taught the bot to read three GitHub security signals. v0.2.1 teaches it to run against a small fleet without losing the guardrails. New flag: `--repos org/a,org/b,org/c`.
+> What v0.2.0 promised — LLM never acts alone, sandwiched between two deterministic layers — got audited by something harder than my fixtures: 38 real alerts in a repo with vendored Bootstrap inside.
 >
-> Three things the batch mode does that a bash loop with `set -e` does not:
+> First live run: 0 reproducibles, 34 needs_review. The LLM-Prosecutor was attacking 32/32 code-scanning alerts with the same verbatim argument: "no direct package usage hits or vulnerable API usage hits." 32 times in a row. Structural bug — the Prosecutor reads an EvidenceMatrix that only has data when the source is Dependabot. For code-scanning every field is zero by construction, and the LLM concludes "not exploitable" out of nothing.
 >
-> 1️⃣ Error isolation. Each repo runs inside a helper that **never raises** — auth failures, fetch errors, unexpected crashes are caught, recorded with their exit code, and the batch moves to the next repo. One blown-up repo cannot abort the other forty-nine. The single-repo `--repo` path now shares the same helper.
+> Same bug I had already fixed in the deterministic layer. It moved layers. Lesson: **when you add an adversarial LLM step, make sure it can reason about the evidence it receives.** Asking it to falsify a verdict from fields that don't apply guarantees it will falsify everything.
 >
-> 2️⃣ Per-repo summary at the end. `ok` / `FAIL` per repo with fast-path count, continue count, and the failure message when applicable. Auditable in a `cron` log without scrolling thousands of lines.
+> Other bugs that only appeared in production:
 >
-> 3️⃣ Honest exit code. The batch returns the worst exit code seen — if three out of fifty repos failed, `cron` detects it. Nothing about the last repo succeeding silently swallowing the partial failure.
+> — `--dry-run` was polluting `.triage_history.jsonl`. "Mutates nothing" must enumerate *every* mutation; it's easy to forget the history log because "it's just a log."
 >
-> What it does **not** do, on purpose: it isn't parallel (GitHub rate limits on a shared PAT make parallel batches a foot-gun), it doesn't accept a config file (if your fleet needs YAML, you've outgrown this mode), and it doesn't allow `--sources` overrides per repo (sources are global to the batch).
+> — The `autotriage` label did not exist on the repo, GitHub silently dropped it, label-filtered dedupe broke. Every CREATE produced duplicates. External APIs do silent things — defend against side-effects that didn't actually happen.
 >
-> And the important part: **tier-1 guardrails are evaluated per repo inside the batch**. A critical repo inside a fifty-repo batch still never auto-dismisses. The `transition_floor = inf` + explicit early return for tier-1, and the "secret scanning has no dismiss method on the client at all" — all intact, all per repo.
+> — My PAT could CREATE Issues but not COMMENT (403). Fine-grained PAT permissions are unauditable without poking the API. The bot now has a documented pre-flight check and soft-fail with visibility.
 >
-> Stack: Python 3.11, single runtime dependency (`httpx`), GitHub Actions cron + `workflow_dispatch`. EN and ES READMEs. `--offline` mode with fixtures lets you exercise the whole pipeline without spending tokens.
+> After the four fixes: 11 unique Issues, 25 XSS correctly classified as reproducible, 4 false positives ready for auto-archive, 9 legitimate needs_review. **That's a productive bot.**
 >
-> Code: https://github.com/safernandez666/appsec-triage
-> Full blog post: coming soon.
+> The README now ships a 9-step production guide — each step is a slightly-closer-to-real sandbox, each one surfaces a class of bugs the previous step can't.
 >
-> When you wrap a batch driver around an existing single-target pipeline, do you make it reuse the single-target function, or do you rewrite the logic inside the loop?
+> https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1
+>
+> What's your most memorable "only appears in production" bug? Today I'm cashing in the Prosecutor one.
 >
 > #AppSec #SecurityEngineering #LLM #OpenSource
 
@@ -90,19 +99,19 @@
 
 - **Cover image** → arrastrá `docs/blog-cover.png` (1600×840) al editor de LinkedIn antes de pegar el texto. LinkedIn lo va a mostrar arriba del post automáticamente.
 
+- **Release URL** → ya está en las tres versiones (`https://github.com/safernandez666/appsec-triage/releases/tag/v0.2.1`). Cuando salga el blog post de Hashnode, agregalo arriba del URL del release: `Blog post: <url>` en una línea propia para que se vea como link visual prominente.
+
 - **Hashtags** → mantené 3-5 max. LinkedIn premia engagement, no etiquetas. Para AppSec específicamente, los más rankeantes hoy son `#AppSec`, `#SecurityEngineering`, `#DevSecOps`, `#LLM`, `#OpenSource`. Evitá los genéricos (`#cybersecurity`, `#tech`).
 
 - **Timing recomendado** (Argentina, audiencia LATAM + global):
   - Martes/jueves 9-11am ART (12-14 UTC) — captura LATAM mañana + Europa tarde.
   - Evitá viernes tarde y lunes temprano.
 
-- **Cuando salga el blog post de Hashnode**: editás el post de LinkedIn y reemplazás "Blog post completo: en breve" por la URL directa. LinkedIn permite editar sin perder engagement (a diferencia de Twitter/X).
-
-- **Cross-post a Twitter/X**: si querés, recortás la **versión corta** a 280 chars + screenshot del cover. Misma quote del callout funciona como tweet único.
+- **Cross-post a Twitter/X**: si querés, recortás la **versión corta** a 280 chars + screenshot del cover. La pregunta del cierre funciona como tweet único.
 
 - **Engagement hooks que funcionan**:
   - La pregunta abierta del cierre (el algoritmo prioriza posts con replies).
   - Citar a alguien específico que sepas que tiene opinión técnica sobre el tema (en comments, no en el post — el @ en el body baja reach).
-  - Responder vos mismo el primer comment con un detalle extra ("una cosa que no entró: …") — duplica las replies.
+  - Responder vos mismo el primer comment con un detalle extra ("el bug del LLM-Prosecutor pegó tan bien que tuve que agregar un modo verbose nuevo para descubrirlo…") — duplica las replies.
 
-- **Si querés mantener la v0.2.0 viva**: el teaser de v0.2.0 está en el git history (commit `d43c15f`). Si todavía no posteaste v0.2.0, considerá postearla primero y dejar v0.2.1 para una semana después — dos releases en el mismo día se canibalizan el algoritmo.
+- **Bug-confession framing**: La narrativa "cuatro bugs que solo aparecen en producción" tiene mejor engagement que "feature nueva". La gente comenta más sobre fallas que sobre wins — usá eso. Si bajás la guardia y mostrás que tu bot rompía cosas, la audiencia confía más.
