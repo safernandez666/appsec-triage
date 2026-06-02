@@ -15,6 +15,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from triage.advisory_agent import AdvisoryResult, extract_vulnerable_apis
@@ -118,6 +119,37 @@ FIXTURES_DIR = _resolve_fixtures_dir()
 HISTORY_PATH = _resolve_history_path()
 
 
+# ---- Output verbosity -----------------------------------------------------
+#
+# Three levels, set once in main() by -v / -q flags:
+#   - QUIET   : alert details suppressed; only banner + repo header + summary
+#   - NORMAL  : one condensed line per alert + summary (default)
+#   - VERBOSE : full Z1 → Z2 → Z3 → Z4 tree per alert (the debug view)
+#
+# Module-global because the CLI processes one cycle per process; passing
+# a verbosity arg through every formatter call adds noise without value.
+
+class _OutputLevel(Enum):
+    QUIET = "quiet"
+    NORMAL = "normal"
+    VERBOSE = "verbose"
+
+
+_LEVEL: _OutputLevel = _OutputLevel.NORMAL
+
+
+def _vprint(*args: object, **kwargs: object) -> None:
+    """Print only in VERBOSE mode (debug-style Z1-Z4 tree)."""
+    if _LEVEL is _OutputLevel.VERBOSE:
+        print(*args, **kwargs)  # type: ignore[arg-type]
+
+
+def _nprint(*args: object, **kwargs: object) -> None:
+    """Print at NORMAL or VERBOSE — i.e. anything that isn't quiet-only."""
+    if _LEVEL is not _OutputLevel.QUIET:
+        print(*args, **kwargs)  # type: ignore[arg-type]
+
+
 # ---- Summary tally --------------------------------------------------------
 #
 # Module-level mutable counters reset at the start of every `_route_and_print`
@@ -164,6 +196,71 @@ def _fmt_summary(prefix: str = "[cycle]") -> str:
         f"{prefix} verdicts:  " + " · ".join(v_parts) + "\n"
         f"{prefix} actions:   " + " · ".join(a_parts)
     )
+
+
+def _condensed_alert_body(a: Alert) -> str:
+    """Compact one-line identity for an alert. No severity/state — those
+    go in dedicated columns of the condensed line."""
+    if a.source is AlertSource.CODE_SCANNING:
+        loc = a.location_path or "?"
+        if a.location_line is not None:
+            loc = f"{loc}:{a.location_line}"
+        return f"{a.rule_id or '?'} @ {loc}"
+    if a.source is AlertSource.SECRET_SCANNING:
+        return f"secret: {a.secret_type or '?'}"
+    cve = a.cve_id or a.ghsa_id or "?"
+    return f"{a.package_name} — {cve}"
+
+
+_SOURCE_SHORT = {
+    AlertSource.DEPENDABOT: "dep",
+    AlertSource.CODE_SCANNING: "cs ",
+    AlertSource.SECRET_SCANNING: "sec",
+}
+
+_SEV_SHORT = {
+    "critical": "crit",
+    "high":     "high",
+    "medium":   "med ",
+    "low":      "low ",
+}
+
+
+def _emit_condensed(
+    a: Alert,
+    verdict: Verdict | None,
+    action_kind: str,
+    *,
+    verdict_source_hint: str | None = None,
+    note: str | None = None,
+) -> None:
+    """Print one compressed line for an alert under NORMAL verbosity.
+
+    Format:  `<ACTION>  #N  <sev>  <src>  <identity>  → <verdict>  (<source>)  <note?>`
+
+    `verdict` may be None for fast-path closes (where no verdict was produced).
+    `verdict_source_hint` overrides verdict.source — used to surface the
+    Z3 stage that actually decided (truth_table / consensus / judge /
+    prosecutor / critic) when the final source field is too generic.
+
+    Skipped in QUIET (no per-alert output) and in VERBOSE (the full tree
+    already shows the same data; the condensed line would just duplicate).
+    """
+    if _LEVEL is not _OutputLevel.NORMAL:
+        return
+    sev = _SEV_SHORT.get((a.severity or "").lower(), (a.severity or "?")[:4])
+    src = _SOURCE_SHORT.get(a.source, a.source.value[:3])
+    head = f"  {col.action(action_kind):<7}  #{a.number:<3} {sev}  {src}  {_condensed_alert_body(a)}"
+    if verdict is None:
+        # Fast-path or other no-verdict outcome — surface the note instead.
+        tail = f"  {col.dim(note or '—')}"
+        _nprint(head + tail)
+        return
+    src_str = verdict_source_hint or verdict.source
+    verdict_label = col.verdict(verdict.kind.value)
+    src_dim = col.dim(f"({src_str})")
+    note_str = f"  {col.dim(note)}" if note else ""
+    _nprint(f"{head}  → {verdict_label}  {src_dim}{note_str}")
 
 
 def _fmt_repo(r: RepoProfile) -> str:
@@ -242,9 +339,18 @@ def _fmt_prosecutor(pr: ProsecutorResult) -> str:
     if pr.contradictions:
         codes = [c.code for c in pr.contradictions]
         via = "LLM attack" if pr.attacked_by_llm else "deterministic"
+        # Reasons drive everything — without them we cannot tell whether the
+        # Prosecutor is finding a real flaw or rejecting a verdict on
+        # structural grounds (e.g. "no reachability evidence" against a
+        # code-scanning alert, which by definition has none). Show the why
+        # alongside the code on its own indented line.
+        reasons = "\n".join(
+            f"          • {c.code}: {c.why}" for c in pr.contradictions
+        )
         return (
             f"      {col.bad(f'[Z3 prosecutor: CONTRADICTION via {via}]')} "
             f"codes={codes} request_recompute={pr.request_recompute}\n"
+            f"{reasons}\n"
             f"        {col.bad('verdict degraded → needs_review')} "
             f"(source={pr.verdict.source})"
         )
@@ -339,30 +445,34 @@ def _route_and_print(
     fast = 0
     cont = 0
     for s in sets:
-        print(_fmt_repo(s.repo))
+        _nprint(_fmt_repo(s.repo))
         for a in s.alerts:
-            print(_fmt_alert_header(a))
+            _vprint(_fmt_alert_header(a))
             decision = route(a)
             if decision.path is FastPath.CLOSE_ALREADY_RESOLVED:
-                print(f"      {col.z1('[Z1 fast-path: close]')} {decision.note}")
+                _vprint(f"      {col.z1('[Z1 fast-path: close]')} {decision.note}")
                 ia = handle_fast_path_close(client, s.repo, a, decision.note, flags)
                 _tally_action(ia)
-                print(_fmt_issue_action(ia))
+                _vprint(_fmt_issue_action(ia))
+                _emit_condensed(
+                    a, verdict=None, action_kind=ia.kind,
+                    note=f"fast-path: {decision.note}",
+                )
                 fast += 1
                 expected = a.meta.get("expected_verdict")
                 if expected:
-                    print(col.dim(f"      (fixture expects: {expected})"))
+                    _vprint(col.dim(f"      (fixture expects: {expected})"))
                 continue
 
             if a.source is AlertSource.SECRET_SCANNING:
-                print(f"      {col.z1('[Z1 continue]')} → Z4 short-circuit (secret scanning)")
+                _vprint(f"      {col.z1('[Z1 continue]')} → Z4 short-circuit (secret scanning)")
             else:
-                print(f"      {col.z1('[Z1 continue]')} → Zone 2 investigation")
+                _vprint(f"      {col.z1('[Z1 continue]')} → Zone 2 investigation")
             cont += 1
             _process_alert(a, s.repo, client, flags)
             expected = a.meta.get("expected_verdict")
             if expected:
-                print(col.dim(f"      (fixture expects: {expected})"))
+                _vprint(col.dim(f"      (fixture expects: {expected})"))
     return fast, cont
 
 
@@ -384,7 +494,7 @@ def _process_alert(
         return _process_secret_alert(a, repo, client, flags)
     verdict, want_recompute = _run_pipeline_once(a, repo, client, flags, is_recomputed=False)
     if want_recompute:
-        print(f"      {col.z3('[Z3 prosecutor]')} requesting evidence recompute (one-shot allowed)")
+        _vprint(f"      {col.z3('[Z3 prosecutor]')} requesting evidence recompute (one-shot allowed)")
         verdict, _ = _run_pipeline_once(a, repo, client, flags, is_recomputed=True)
     return verdict
 
@@ -396,13 +506,13 @@ def _process_secret_alert(
     flags: CycleFlags,
 ) -> Verdict:
     """Z1 → Z4 short-circuit for secret scanning. No LLM, no judgment."""
-    print(f"      {col.dim('[Z2 SKIPPED]')} {col.dim('secret scanning — no investigation, no judgment')}")
+    _vprint(f"      {col.dim('[Z2 SKIPPED]')} {col.dim('secret scanning — no investigation, no judgment')}")
     v = build_rotate_now_verdict(a)
-    print(
+    _vprint(
         f"      {col.verdict('rotate_now', '[Z3 verdict: ROTATE_NOW]')} "
         f"confidence={v.confidence:.2f} source={v.source}"
     )
-    print(f"        \"{v.human_conclusion}\"")
+    _vprint(f"        \"{v.human_conclusion}\"")
     # Use a synthetic Tier classification at INTERNAL — the secret pipeline
     # does not consult tier floors for dismiss (dismiss is structurally
     # blocked), but the Critic and history append still want a value.
@@ -430,20 +540,20 @@ def _run_pipeline_once(
         else:
             em = collect_evidence_online(a, repo, client, advisory_apis=adv.apis)  # type: ignore[arg-type]
         available_str = "yes" if adv.available else "no"
-        print(
+        _vprint(
             f"      {col.z2(f'[Z2 advisory{prefix}]')} llm_available={available_str} "
             f"apis={list(adv.apis)} ({adv.note})"
         )
-        print(_fmt_evidence(em))
+        _vprint(_fmt_evidence(em))
     else:
         # CodeQL: the rule.description IS the advisory; no extraction needed.
         # Secret scanning: never reaches here in v2-4+ (Z1 short-circuits).
-        print(
+        _vprint(
             f"      {col.z2(f'[Z2 advisory{prefix}]')} N/A for source={a.source.value} "
             f"(rule already names the finding)"
         )
         em = empty_evidence_for_non_dependabot(a)
-        print(
+        _vprint(
             f"      {col.z2('[Z2 evidence]')} source={a.source.value} "
             f"rule={a.rule_id or '—'} "
             f"location={a.location_path or '—'}:{a.location_line or '—'}"
@@ -451,10 +561,10 @@ def _run_pipeline_once(
 
     tier_override = _tier_override_from_meta(a) if offline else None
     tt = preflight(a, repo, em, tier_override=tier_override)
-    print(_fmt_tier(tt.tier))
+    _vprint(_fmt_tier(tt.tier))
 
     if tt.forced:
-        print(_fmt_forced_verdict(tt.forced_verdict))  # type: ignore[arg-type]
+        _vprint(_fmt_forced_verdict(tt.forced_verdict))  # type: ignore[arg-type]
         # Forced verdicts get a confirm-only Prosecutor: no LLM attack, no recompute.
         pr = prosecute(
             tt.forced_verdict,  # type: ignore[arg-type]
@@ -462,7 +572,7 @@ def _run_pipeline_once(
             enable_llm_attack=False,
             is_recomputed=True,
         )
-        print(_fmt_prosecutor(pr))
+        _vprint(_fmt_prosecutor(pr))
         final = _finalize(a, repo, pr.verdict, tt.tier, client, flags)
         return final, False
 
@@ -471,21 +581,21 @@ def _run_pipeline_once(
     # to that consensus and skip the LLM. Prosecutor downstream can still
     # degrade if local evidence contradicts.
     consensus = find_fp_consensus(a, HISTORY_PATH, exclude_repo=repo.full_name)
-    print(_fmt_consensus(consensus))
+    _vprint(_fmt_consensus(consensus))
     if consensus.has_consensus:
         v = consensus_verdict(consensus, a)
-        print(_fmt_consensus_verdict(v))
+        _vprint(_fmt_consensus_verdict(v))
     else:
-        print(f"      {col.dim('[Z2 truth_table]')} {col.dim('no forced verdict → invoking Final Judge')}")
+        _vprint(f"      {col.dim('[Z2 truth_table]')} {col.dim('no forced verdict → invoking Final Judge')}")
         v = judge(a, repo, em, tt.tier)
-        print(_fmt_judge_verdict(v))
+        _vprint(_fmt_judge_verdict(v))
 
     pr = prosecute(
         v, a, repo, em, tt.tier,
         enable_llm_attack=True,
         is_recomputed=is_recomputed,
     )
-    print(_fmt_prosecutor(pr))
+    _vprint(_fmt_prosecutor(pr))
     want_recompute = pr.request_recompute and not is_recomputed
     if want_recompute:
         # Throwaway pass: do NOT critique, do NOT touch consistency / history /
@@ -506,14 +616,21 @@ def _finalize(
 ) -> Verdict:
     """Silent gates + history + Issue/Dependabot side-effects."""
     critiqued = critique(v, tier)
-    print(_fmt_critic(v, critiqued))
+    _vprint(_fmt_critic(v, critiqued))
     decision = evaluate_consistency(critiqued, repo, a, HISTORY_PATH)
-    print(_fmt_consistency(decision))
+    _vprint(_fmt_consistency(decision))
     append_history(HISTORY_PATH, repo, a, critiqued)
     ia = handle_issue(client, repo, a, critiqued, tier, decision, flags)
-    print(_fmt_issue_action(ia))
+    _vprint(_fmt_issue_action(ia))
     _tally_verdict(critiqued)
     _tally_action(ia)
+    # NORMAL mode: emit one compressed line summarizing this alert's outcome.
+    # The consistency action (GUARD/POST/FIRST/SKIP) is surfaced as a note
+    # because GUARD is operator-actionable: "verdict flipped, please review".
+    note = None
+    if decision.action.value.upper() == "GUARD":
+        note = "[guard] please review"
+    _emit_condensed(a, critiqued, ia.kind, note=note)
     return critiqued
 
 
@@ -810,6 +927,25 @@ def build_parser() -> argparse.ArgumentParser:
             "Use 'all' for the three of them. Default: dependabot (v1 compat)."
         ),
     )
+    verb = p.add_mutually_exclusive_group()
+    verb.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help=(
+            "Print the full Z1 → Z2 → Z3 → Z4 tree for every alert. "
+            "Use this when debugging the bot itself. Default is a single "
+            "condensed line per alert."
+        ),
+    )
+    verb.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help=(
+            "Suppress per-alert output. Only the banner, repo headers, "
+            "and the final verdict/action summary are printed. Use this "
+            "for cron and Slack-style notifications."
+        ),
+    )
     return p
 
 
@@ -820,6 +956,13 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     print_banner()
     args = build_parser().parse_args(argv)
+    global _LEVEL
+    if args.verbose:
+        _LEVEL = _OutputLevel.VERBOSE
+    elif args.quiet:
+        _LEVEL = _OutputLevel.QUIET
+    else:
+        _LEVEL = _OutputLevel.NORMAL
     try:
         sources = _parse_sources(args.sources)
     except ValueError as e:
