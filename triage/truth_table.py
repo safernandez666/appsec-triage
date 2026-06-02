@@ -25,9 +25,18 @@ Final Judge (Phase 7).
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from triage.types import Alert, EvidenceMatrix, RepoProfile, Tier, Verdict, VerdictKind
+from triage.types import Alert, AlertSource, EvidenceMatrix, RepoProfile, Tier, Verdict, VerdictKind
+
+# v2: heuristic test-path detector. Conservative — matches the conventional
+# layouts only. Edge cases (e.g. tests embedded inside a package using
+# `_test.py` suffix) get caught downstream by the Judge.
+_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs|e2e)(/|$)",
+    re.IGNORECASE,
+)
 
 # (post_floor, transition_floor) per tier.
 # Transition for CRITICAL is +inf — auto-dismiss is structurally impossible.
@@ -106,11 +115,55 @@ def preflight(
     tier_override: Tier | None = None,
 ) -> TruthTableResult:
     tier = classify_tier(repo, evidence, tier_override)
-    forced = _try_force_verdict(repo, evidence)
+    # v2: dispatch by source — Dependabot and CodeQL have different forcing rules.
+    # Secret scanning never reaches here (Z1 short-circuits in v2-4).
+    if alert.source is AlertSource.CODE_SCANNING:
+        forced = _try_force_code_scanning_verdict(alert, repo)
+    else:
+        forced = _try_force_dependabot_verdict(repo, evidence)
     return TruthTableResult(tier=tier, forced_verdict=forced)
 
 
-def _try_force_verdict(repo: RepoProfile, evidence: EvidenceMatrix) -> Verdict | None:
+def _try_force_code_scanning_verdict(alert: Alert, repo: RepoProfile) -> Verdict | None:
+    """v2 — CodeQL / code-scanning forcing rules.
+
+    Rule C — `location_path` matches a test directory → `false_positive`. A
+        SAST finding inside a test file describes a vulnerability that lives
+        in test scaffolding, not in runtime code. The dismiss reason for CodeQL
+        will be `used in tests` (see issue_manager._dismiss_reason).
+
+    Rule D — `archived AND state == "open"` → `false_positive`. Analogous to
+        Dependabot's Rule A: an archived repo cannot be exploited even if the
+        rule still flags it.
+    """
+    # Rule C: location in tests/
+    if alert.location_path and _TEST_PATH_RE.search(alert.location_path):
+        return Verdict(
+            kind=VerdictKind.FALSE_POSITIVE,
+            confidence=0.92,
+            human_conclusion=(
+                f"The CodeQL finding at `{alert.location_path}` is inside a test "
+                "directory. The vulnerability described by this rule cannot be "
+                "exercised from production runtime; it lives in test scaffolding."
+            ),
+            source="truth_table:codeql_in_tests",
+        )
+    # Rule D: archived repo
+    if repo.archived:
+        return Verdict(
+            kind=VerdictKind.FALSE_POSITIVE,
+            confidence=0.93,
+            human_conclusion=(
+                f"This finding lives in `{repo.full_name}`, an archived repository. "
+                "Code in archived repos is not deployed or executed; the finding "
+                "cannot be exploited from any live surface."
+            ),
+            source="truth_table:codeql_archived",
+        )
+    return None
+
+
+def _try_force_dependabot_verdict(repo: RepoProfile, evidence: EvidenceMatrix) -> Verdict | None:
     # Rule A — archived + no direct code hits.
     if repo.archived and evidence.direct_package_hits == 0:
         return Verdict(

@@ -8,7 +8,7 @@
 
 Multi-agent defensive triage of Dependabot alerts. Reduces false positives and the team's alert fatigue. GitHub-native. Python 3.11+. Single runtime dependency: `httpx`.
 
-> **Status:** Proof of Concept. v1 consumes Dependabot alerts only. CodeQL and secret scanning are documented [extension hooks](#extending-to-v2) for v2.
+> **Status:** v0.2.0. Ingests three sources: Dependabot, GitHub Code Scanning (CodeQL + 3rd-party SAST), and Secret Scanning. See [Sources](#sources).
 
 ## Why this exists
 
@@ -140,28 +140,43 @@ Exit codes: `0` ok · `1` empty input · `2` arg or auth error · `3` fetch erro
 ## Limitations (PoC)
 
 - **`/search/code` only indexes the default branch and files smaller than 384 KB.** Code on feature branches, in vendored subtrees, or in oversized generated files is invisible to reachability. The Truth Table treats absence-of-hits as evidence only under explicit conditions; the Judge is told about the caveat in its prompt.
-- v1 consumes Dependabot alerts only. CodeQL and secret scanning are documented hooks for v2.
+- v2 ingests Dependabot, CodeQL/SAST, and Secret Scanning. New sources (Dependency Review API at PR time, supply chain attestations, runtime telemetry) are not wired.
 - The LLM endpoint must speak the OpenAI chat completions API. Anything that doesn't (raw Anthropic API, Bedrock InvokeModel) needs a thin adapter.
 - History persistence in CI is artifact-only. See [Memory](#memory-and-org-wide-consensus).
 - Self-feedback is excluded but cross-org coupling is not modeled. If your "org" has subgroups with different risk postures, partition the history file per group.
 
-## Extending to v2
+## Sources
 
-Two extension hooks live just past Zone 1's source resolution. Both are deliberately not wired:
+Three GitHub security signals, three risk models. Pick what to ingest with `--sources` (`dependabot` | `code-scanning` (alias `codeql`) | `secret-scanning` (alias `secret`) | `all` | comma-separated). Default = `dependabot` for v1 compatibility.
 
-### CodeQL alerts
+### Dependabot
 
-- Extend `GitHubClient` with `list_code_scanning_alerts(owner, name)` against `/repos/{o}/{r}/code-scanning/alerts`.
-- Add an `Alert.from_code_scanning_payload` classmethod that fills the same flat shape (the rest of the pipeline is agnostic).
-- Extend the `EvidenceMatrix` to carry CodeQL-specific signals (rule id, location, dataflow class). The Judge prompt grows a section; the Truth Table rules can stay or get CodeQL analogs.
-- Reuse Advisory + Judge + Prosecutor + Critic + Consistency unchanged.
+Full Z1 → Z2 → Z3 → Z4 pipeline. Truth Table Rules A (`archived AND no hits`) and B (`advisory APIs AND no hits AND repo representative`) can force `false_positive` without invoking the Judge. Org-wide consensus over `(CVE+package)` works across repositories of the same org. Dismiss vocabulary: `not_used` / `inaccurate` / `tolerable_risk` (the last one is **never** chosen automatically).
 
-### Secret scanning alerts
+### Code Scanning (CodeQL + 3rd-party SAST)
 
-- Different risk model: there is no "is it reproducible?" question — a leaked secret is leaked.
-- **Short-circuit** in Z1 routing: a fresh secret scanning alert → open a "rotate now" Issue with the location of the leak and which secret type, no LLM involvement, no Truth Table, no Prosecutor.
-- Consistency Gate still applies (SKIP if the same secret was already reported).
-- Auto-transition is permanently off for this source — humans must confirm rotation.
+Same pipeline shape but **the question is different**: "is this finding actionable in this repo?" rather than "does this dependency affect this repo?".
+
+- Advisory Agent is skipped (the rule already names what is vulnerable).
+- Evidence Agent is replaced by location metadata from the alert itself.
+- Two Truth Table rules unique to CodeQL:
+  - **Rule C** — `location_path` inside a test directory (`tests/`, `__tests__/`, `spec/`, `e2e/`, …) → `false_positive`. SAST findings inside test scaffolding are not exploitable from runtime.
+  - **Rule D** — repo archived → `false_positive` (analogous to Dependabot's Rule A).
+- Judge prompt is a different file (`JUDGE_SYSTEM_PROMPT_CODE_SCANNING`) so the model frames its reasoning around reachability of the rule pattern, not dependency usage.
+- Dismiss vocabulary: `"false positive"` / `"won't fix"` / `"used in tests"` (note the spaces — that's the CodeQL API contract).
+
+### Secret Scanning — short-circuit
+
+**Different risk model entirely.** A leaked credential is leaked; there is no "is it reproducible?" question to ask. The pipeline collapses to:
+
+```
+Z1 routing  →  Z4 output  (no Z2, no Z3, no LLM)
+```
+
+- `VerdictKind.ROTATE_NOW` is the only verdict a secret alert can have. `confidence=1.0` — this is structural, not probabilistic.
+- Issue body is an urgent "rotate now" template with rotation steps, the location of the leak, the commit SHA, and an explicit reminder that removing the secret from git history is not sufficient (it may have been scraped already).
+- Auto-dismiss is **structurally impossible** for this source: (1) the `GitHubClient` does not expose a `dismiss_secret_scanning_alert` method, (2) `issue_manager._maybe_dismiss` short-circuits with `GUARDRAIL: secret scanning alerts are never auto-dismissed`. Belt + suspenders.
+- The Consistency Gate still applies — a re-detected secret yields SKIP, not a duplicate Issue.
 
 ## Project layout
 
@@ -178,11 +193,12 @@ appsec-triage/
 │   ├── evidence_agent.py        # Z2 deterministic facts (counts + booleans)
 │   ├── truth_table.py           # Z2 tier + forced verdicts (Rules A/B)
 │   ├── memory.py                # org-wide consensus reader (≥3 other repos)
-│   ├── judge.py                 # Z3 LLM Judge, strict JSON contract
+│   ├── judge.py                 # Z3 LLM Judge, strict JSON contract (per-source prompts)
 │   ├── prosecutor.py            # Z3 adversarial — deterministic + LLM attack
 │   ├── critic.py                # Z3 silent quality gate (tier floor)
 │   ├── consistency.py           # Z3 anti flip-flop + history append
-│   └── issue_manager.py         # Z4 Issue + Dependabot dismiss + tier-1 guardrail
+│   ├── secret_scanning.py       # v2: Z1→Z4 short-circuit + rotate-now Issue body
+│   └── issue_manager.py         # Z4 Issue + source-aware dismiss + tier-1 guardrail
 ├── fixtures/alerts/             # offline demo data
 ├── docs/                        # diagrams (architecture.svg + sequence.svg + HTML versions)
 ├── .github/workflows/triage.yml # cron + workflow_dispatch

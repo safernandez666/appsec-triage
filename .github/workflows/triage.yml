@@ -15,8 +15,13 @@ on:
         description: 'Target repo as owner/name. Defaults to this repository.'
         required: false
         type: string
+      sources:
+        description: 'Alert sources to ingest (dependabot, codeql, secret, all, or comma-separated).'
+        required: false
+        default: 'dependabot'
+        type: string
       auto_transition:
-        description: 'Auto-dismiss false_positive Dependabot alerts (tier-1 always blocked).'
+        description: 'Auto-dismiss false_positive alerts (tier-1 always blocked; secrets always blocked).'
         required: false
         default: false
         type: boolean
@@ -26,14 +31,22 @@ on:
         default: false
         type: boolean
 
-# Minimum permissions for the embedded GITHUB_TOKEN.
-# - security-events: write   PATCH /dependabot/alerts/{n} (dismiss)
-# - issues: write             POST  /issues + /issues/{n}/comments + close
-# - contents: read            checkout
+# Minimum permissions for the embedded GITHUB_TOKEN. v2 adds code scanning
+# (same `security-events` scope as Dependabot) and secret scanning (its own
+# scope; read-only because the bot deliberately never dismisses secrets).
+#
+# - security-events: write       PATCH /dependabot/alerts/{n}  (dismiss)
+#                                PATCH /code-scanning/alerts/{n} (dismiss, v2)
+# - secret-scanning-alerts: read GET /secret-scanning/alerts (v2; no write)
+# - issues: write                POST /issues + /issues/{n}/comments + close
+# - contents: read               checkout
 permissions:
   contents: read
   issues: write
   security-events: write
+  # v2: read-only on purpose. Secret rotation is a human decision; the bot
+  # opens an Issue and humans close it after rotating upstream.
+  secret-scanning-alerts: read
 
 # Prevent overlapping triage cycles on the same workflow file. We do NOT
 # cancel-in-progress: triage should run to completion so history stays
@@ -76,9 +89,10 @@ jobs:
           LLM_MODEL:    ${{ secrets.LLM_MODEL }}
           GITHUB_TOKEN: ${{ secrets.APPSEC_TRIAGE_TOKEN || github.token }}
           TARGET_REPO:  ${{ inputs.repo || github.repository }}
+          SOURCES:      ${{ inputs.sources || 'dependabot' }}
         run: |
           set -euo pipefail
-          ARGS=( --repo "$TARGET_REPO" )
+          ARGS=( --repo "$TARGET_REPO" --sources "$SOURCES" )
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS+=( --dry-run )
           fi

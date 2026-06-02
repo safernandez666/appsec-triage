@@ -1,0 +1,39 @@
+{
+  "number": 401,
+  "state": "open",
+  "rule": {
+    "id": "py/sql-injection",
+    "name": "py/sql-injection",
+    "description": "User-controlled data flows to a SQL query",
+    "full_description": "User-controlled data is used to construct a SQL query without proper sanitization. An attacker can inject arbitrary SQL syntax and exfiltrate or modify data.",
+    "security_severity_level": "high",
+    "severity": "error"
+  },
+  "tool": {"name": "CodeQL", "version": "2.16.0"},
+  "most_recent_instance": {
+    "location": {
+      "path": "app/database/queries.py",
+      "start_line": 87,
+      "end_line": 87,
+      "start_column": 18,
+      "end_column": 64
+    },
+    "message": {
+      "text": "This SQL query depends on a user-controlled value from request.args.get('search')."
+    }
+  },
+  "created_at": "2026-04-12T08:00:00Z",
+  "html_url": "https://github.com/example-org/active-service/security/code-scanning/401",
+  "_meta": {
+    "expected_verdict": "reproducible",
+    "expected_reason": "SQL injection in production code path, reachable from HTTP layer",
+    "repo_profile_hint": {
+      "owner": "example-org",
+      "name": "active-service",
+      "archived": false,
+      "language": "Python",
+      "age_days": 600,
+      "tier": 2
+    }
+  }
+}

@@ -25,9 +25,14 @@ from typing import Any
 
 from triage.llm import LLMNotConfigured, chat
 from triage.truth_table import TierClassification
-from triage.types import Alert, EvidenceMatrix, RepoProfile, Verdict, VerdictKind
+from triage.types import Alert, AlertSource, EvidenceMatrix, RepoProfile, Verdict, VerdictKind
 
-JUDGE_SYSTEM_PROMPT = """You are a defensive AppSec triage judge. You receive \
+# v2: two distinct system prompts because the underlying question is different.
+# Dependabot:  "does this vulnerable dependency actually affect this repo?"
+# Code scanning: "is this SAST finding actionable in this repo?"
+# Same JSON contract; different framing.
+
+JUDGE_SYSTEM_PROMPT_DEPENDABOT = """You are a defensive AppSec triage judge. You receive \
 evidence about a Dependabot alert in a specific repository and return a verdict.
 
 CONTRACT — strict JSON only, no prose around it:
@@ -63,6 +68,50 @@ REASONING RULES:
   return "needs_review"."""
 
 
+JUDGE_SYSTEM_PROMPT_CODE_SCANNING = """You are a defensive AppSec triage judge. You \
+receive a code-scanning (CodeQL or SAST) finding from a specific repository and return \
+a verdict on whether the finding is actionable.
+
+CONTRACT — strict JSON only, no prose around it:
+{
+  "verdict": "false_positive" | "reproducible" | "needs_review",
+  "confidence": <number between 0 and 1>,
+  "human_conclusion": "<plain English, 1 to 3 sentences>"
+}
+
+VERDICT MEANINGS (note the framing is different from dependency triage):
+- "false_positive": the finding is NOT actionable in this repository. Examples:
+  the rule fires on a pattern that is safe in this context (e.g. user input that
+  was sanitized upstream and the analyzer missed it), the affected code is dead /
+  unreachable, the file is generated and not executed at runtime, or the rule
+  is firing on framework boilerplate.
+- "reproducible": the finding IS actionable. The bug described by the rule is
+  reachable from at least one entry point that the repository exposes, the
+  sanitization path is missing or broken, and a real exploit could be constructed
+  from the public surface.
+- "needs_review": evidence is genuinely insufficient. Failure state, not hedge.
+
+HUMAN_CONCLUSION RULES (hard constraints):
+- Plain English, 1 to 3 sentences.
+- No numbers, no scores, no confidence values.
+- No agent names ("Evidence Agent", "Truth Table", "Advisory Agent" — never).
+- No first person.
+- Reference the rule and the file directly. The human reading the Issue must be
+  able to act on this in one read.
+
+REASONING RULES:
+- Reason only from the rule description, the location, and the message provided.
+  Do not invent code paths that are not stated.
+- A finding in a test directory or fixture file is almost always false_positive
+  (the Truth Table catches that before reaching you — if you receive it anyway,
+  treat it as needs_review and let a human confirm).
+- If the rule severity is critical and the location is in production code that
+  handles external input, lean toward reproducible unless you can name a
+  concrete reason it would not be exploitable.
+- If something that would change your verdict is missing from the evidence,
+  return "needs_review"."""
+
+
 def judge(
     alert: Alert,
     repo: RepoProfile,
@@ -70,10 +119,15 @@ def judge(
     tier: TierClassification,
 ) -> Verdict:
     """Produce a Verdict. Always returns one — fallback paths emit needs_review."""
+    system_prompt = (
+        JUDGE_SYSTEM_PROMPT_CODE_SCANNING
+        if alert.source is AlertSource.CODE_SCANNING
+        else JUDGE_SYSTEM_PROMPT_DEPENDABOT
+    )
     try:
         content = chat(
             messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": _build_user_payload(alert, repo, evidence, tier)},
             ],
             response_format={"type": "json_object"},
@@ -90,6 +144,18 @@ def judge(
 
 
 def _build_user_payload(
+    alert: Alert,
+    repo: RepoProfile,
+    em: EvidenceMatrix,
+    tier: TierClassification,
+) -> str:
+    """v2: dispatch by source. Two distinct framings, same return shape."""
+    if alert.source is AlertSource.CODE_SCANNING:
+        return _build_user_payload_code_scanning(alert, repo, tier)
+    return _build_user_payload_dependabot(alert, repo, em, tier)
+
+
+def _build_user_payload_dependabot(
     alert: Alert,
     repo: RepoProfile,
     em: EvidenceMatrix,
@@ -118,6 +184,31 @@ def _build_user_payload(
         f"  manifest present ({alert.manifest_path or 'unspecified'}): {em.has_manifest}\n"
         f"  lockfile present: {em.has_lockfile}\n"
         f"  Dockerfile present: {em.has_dockerfile}\n"
+    )
+
+
+def _build_user_payload_code_scanning(
+    alert: Alert,
+    repo: RepoProfile,
+    tier: TierClassification,
+) -> str:
+    return (
+        f"Rule: {alert.rule_id or '?'}\n"
+        f"Rule summary: {alert.summary}\n"
+        f"Severity: {alert.severity}\n"
+        f"\n"
+        f"Finding location: {alert.location_path or '?'}:{alert.location_line or '?'}\n"
+        f"Analyzer message:\n{alert.description}\n"
+        f"\n"
+        f"Repository: {repo.full_name}\n"
+        f"  archived: {repo.archived}\n"
+        f"  primary language: {repo.language or 'unknown'}\n"
+        f"  age in days: {repo.age_days}\n"
+        f"  tier: {tier.tier.name.lower()}\n"
+        f"\n"
+        f"Reachability evidence: not gathered for code-scanning findings — the rule "
+        f"already states the location. Reason from the rule, the file path, the "
+        f"message, and the repo metadata above."
     )
 
 

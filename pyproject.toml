@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "appsec-triage"
-version = "0.1.0"
-description = "Multi-agent defensive triage of Dependabot alerts. GitHub-native, single runtime dep (httpx)."
+version = "0.2.0"
+description = "Multi-agent defensive triage of Dependabot, CodeQL, and Secret Scanning alerts. GitHub-native, single runtime dep (httpx)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

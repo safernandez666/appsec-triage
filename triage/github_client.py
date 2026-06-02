@@ -19,11 +19,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from triage.types import Alert, RepoProfile
+from triage.types import Alert, AlertSource, RepoProfile
 
 GITHUB_API = "https://api.github.com"
-USER_AGENT = "appsec-triage-bot/0.1"
-DISMISS_REASONS = {"not_used", "inaccurate", "tolerable_risk"}
+USER_AGENT = "appsec-triage-bot/0.2"
+
+# Dismiss vocabulary differs per source.
+DEPENDABOT_DISMISS_REASONS = {"not_used", "inaccurate", "tolerable_risk"}
+CODE_SCANNING_DISMISS_REASONS = {"false positive", "won't fix", "used in tests"}
+# Secret scanning has NO automated dismiss — humans must rotate then close.
+
+# Back-compat alias for the v1 name. Existing code that imports DISMISS_REASONS
+# is talking about Dependabot.
+DISMISS_REASONS = DEPENDABOT_DISMISS_REASONS
 
 
 @dataclass(frozen=True)
@@ -69,7 +77,34 @@ class GitHubClient:
             params={"state": state, "per_page": 100},
         )
         r.raise_for_status()
-        return [Alert.from_payload(p) for p in r.json()]
+        return [Alert.from_dependabot_payload(p) for p in r.json()]
+
+    def list_code_scanning_alerts(self, owner: str, name: str, state: str = "open") -> list[Alert]:
+        """v2: GitHub Code Scanning (CodeQL + 3rd-party SAST).
+
+        Requires `security_events: read` scope. State filter aligns with the
+        Dependabot listing; CodeQL also supports `dismissed`, `fixed`.
+        """
+        r = self._client.get(
+            f"/repos/{owner}/{name}/code-scanning/alerts",
+            params={"state": state, "per_page": 100},
+        )
+        r.raise_for_status()
+        return [Alert.from_code_scanning_payload(p) for p in r.json()]
+
+    def list_secret_scanning_alerts(self, owner: str, name: str, state: str = "open") -> list[Alert]:
+        """v2: GitHub Secret Scanning.
+
+        Requires `secret_scanning_alerts: read` scope (separate from
+        `security_events`). The dismiss method is INTENTIONALLY not provided
+        — humans must confirm rotation; see issue_manager._maybe_dismiss.
+        """
+        r = self._client.get(
+            f"/repos/{owner}/{name}/secret-scanning/alerts",
+            params={"state": state, "per_page": 100},
+        )
+        r.raise_for_status()
+        return [Alert.from_secret_scanning_payload(p) for p in r.json()]
 
     def path_exists(self, owner: str, name: str, path: str) -> bool:
         """True if `path` exists on the default branch.
@@ -103,8 +138,14 @@ class GitHubClient:
         reason: str,
         comment: str = "",
     ) -> bool:
-        if reason not in DISMISS_REASONS:
-            raise ValueError(f"dismissed_reason must be one of {DISMISS_REASONS}, got {reason!r}")
+        """Dismiss a Dependabot alert. (Back-compat name; new code may also
+        call dismiss_dependabot_alert.)
+        """
+        if reason not in DEPENDABOT_DISMISS_REASONS:
+            raise ValueError(
+                f"Dependabot dismissed_reason must be one of "
+                f"{DEPENDABOT_DISMISS_REASONS}, got {reason!r}"
+            )
         r = self._client.patch(
             f"/repos/{owner}/{name}/dependabot/alerts/{number}",
             json={
@@ -115,6 +156,43 @@ class GitHubClient:
         )
         r.raise_for_status()
         return True
+
+    # v2: explicit alias for clarity.
+    dismiss_dependabot_alert = dismiss_alert
+
+    def dismiss_code_scanning_alert(
+        self,
+        owner: str,
+        name: str,
+        number: int,
+        reason: str,
+        comment: str = "",
+    ) -> bool:
+        """v2: dismiss a CodeQL / code-scanning alert.
+
+        Distinct from Dependabot in vocabulary: CodeQL uses {"false positive",
+        "won't fix", "used in tests"} (with the spaces). The Issue manager
+        decides which reason fits and passes it here.
+        """
+        if reason not in CODE_SCANNING_DISMISS_REASONS:
+            raise ValueError(
+                f"code-scanning dismissed_reason must be one of "
+                f"{CODE_SCANNING_DISMISS_REASONS}, got {reason!r}"
+            )
+        r = self._client.patch(
+            f"/repos/{owner}/{name}/code-scanning/alerts/{number}",
+            json={
+                "state": "dismissed",
+                "dismissed_reason": reason,
+                "dismissed_comment": comment,
+            },
+        )
+        r.raise_for_status()
+        return True
+
+    # v2: secret scanning has no auto-dismiss method on this client by design.
+    # If you reach for it, you are about to do the wrong thing. The bot opens
+    # a "rotate now" Issue; a human closes it manually after rotation.
 
     # ---- Issues ----------------------------------------------------------
 
@@ -251,20 +329,56 @@ class OfflineGitHubClient:
     def dismiss_alert(
         self, owner: str, name: str, number: int, reason: str, comment: str = "",
     ) -> bool:
-        if reason not in DISMISS_REASONS:
-            raise ValueError(f"dismissed_reason must be one of {DISMISS_REASONS}, got {reason!r}")
+        if reason not in DEPENDABOT_DISMISS_REASONS:
+            raise ValueError(
+                f"Dependabot dismissed_reason must be one of "
+                f"{DEPENDABOT_DISMISS_REASONS}, got {reason!r}"
+            )
         self._dismissed.append({
             "owner": owner, "name": name, "number": number,
+            "source": AlertSource.DEPENDABOT.value,
             "reason": reason, "comment": comment,
         })
         return True
 
-    def load_repo_alert_sets(self) -> list[RepoAlertSet]:
+    # v2: offline shadow of the real dismiss_dependabot_alert alias.
+    dismiss_dependabot_alert = dismiss_alert
+
+    def dismiss_code_scanning_alert(
+        self, owner: str, name: str, number: int, reason: str, comment: str = "",
+    ) -> bool:
+        if reason not in CODE_SCANNING_DISMISS_REASONS:
+            raise ValueError(
+                f"code-scanning dismissed_reason must be one of "
+                f"{CODE_SCANNING_DISMISS_REASONS}, got {reason!r}"
+            )
+        self._dismissed.append({
+            "owner": owner, "name": name, "number": number,
+            "source": AlertSource.CODE_SCANNING.value,
+            "reason": reason, "comment": comment,
+        })
+        return True
+
+    # v2: NO dismiss_secret_scanning_alert on offline client either —
+    # intentional asymmetry mirrors the real client.
+
+    def load_repo_alert_sets(
+        self,
+        sources: frozenset[AlertSource] | None = None,
+    ) -> list[RepoAlertSet]:
+        """Load fixtures, optionally filtered to a subset of sources.
+
+        v2: `sources=None` is shorthand for "everything"; pass a frozenset to
+        restrict to one or two of the three v2 sources. The dispatch by payload
+        shape happens inside `Alert.from_payload`.
+        """
         groups: dict[str, tuple[RepoProfile, list[Alert]]] = {}
         for path in sorted(self.fixtures_dir.glob("*.json")):
             with path.open(encoding="utf-8") as f:
                 payload = json.load(f)
             alert = Alert.from_payload(payload)
+            if sources is not None and alert.source not in sources:
+                continue
             hint = alert.meta.get("repo_profile_hint")
             if not hint:
                 raise RuntimeError(

@@ -51,10 +51,10 @@
 
   <!-- ============ NODES ============ -->
 
-  <!-- START oval -->
-  <rect x="320" y="40" width="160" height="44" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
-  <text x="400" y="58" class="node-name" text-anchor="middle">Dependabot alert</text>
-  <text x="400" y="72" class="sublabel" text-anchor="middle">/dependabot/alerts</text>
+  <!-- START oval (v2: 3 sources) -->
+  <rect x="288" y="40" width="224" height="44" rx="20" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+  <text x="400" y="58" class="node-name" text-anchor="middle">Security alert</text>
+  <text x="400" y="72" class="sublabel" text-anchor="middle">Dependabot · CodeQL · Secret</text>
 
   <!-- D1 diamond -->
   <polygon points="400,124 496,164 400,204 304,164" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>

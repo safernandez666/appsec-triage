@@ -24,7 +24,11 @@ from triage.consistency import (
     evaluate as evaluate_consistency,
 )
 from triage.critic import critique
-from triage.evidence_agent import collect_evidence_offline, collect_evidence_online
+from triage.evidence_agent import (
+    collect_evidence_offline,
+    collect_evidence_online,
+    empty_evidence_for_non_dependabot,
+)
 from triage.github_client import GitHubClient, OfflineGitHubClient, RepoAlertSet
 from triage.issue_manager import (
     CycleFlags,
@@ -36,8 +40,46 @@ from triage.judge import judge
 from triage.memory import ConsensusResult, consensus_verdict, find_fp_consensus
 from triage.prosecutor import ProsecutorResult, prosecute
 from triage.routing import FastPath, route
+from triage.secret_scanning import build_rotate_now_verdict
 from triage.truth_table import TierClassification, TruthTableResult, preflight
-from triage.types import Alert, EvidenceMatrix, RepoProfile, Tier, Verdict
+from triage.types import Alert, AlertSource, EvidenceMatrix, RepoProfile, Tier, Verdict
+
+# v2: --sources flag accepts these string tokens.
+_SOURCE_BY_TOKEN: dict[str, AlertSource] = {
+    "dependabot": AlertSource.DEPENDABOT,
+    "code-scanning": AlertSource.CODE_SCANNING,
+    "codeql": AlertSource.CODE_SCANNING,  # ergonomic alias
+    "secret-scanning": AlertSource.SECRET_SCANNING,
+    "secret": AlertSource.SECRET_SCANNING,  # ergonomic alias
+}
+ALL_SOURCES: frozenset[AlertSource] = frozenset(AlertSource)
+
+
+def _parse_sources(arg: str) -> frozenset[AlertSource]:
+    """Parse `--sources` value into a concrete set.
+
+    Accepts `all`, a single token, or a comma-separated list. Unknown tokens
+    are rejected with a clear error so typos do not silently degrade to
+    "Dependabot only" behavior.
+    """
+    arg = (arg or "").strip().lower()
+    if not arg or arg == "all":
+        return ALL_SOURCES
+    out: set[AlertSource] = set()
+    unknown: list[str] = []
+    for token in (t.strip() for t in arg.split(",")):
+        if not token:
+            continue
+        if token in _SOURCE_BY_TOKEN:
+            out.add(_SOURCE_BY_TOKEN[token])
+        else:
+            unknown.append(token)
+    if unknown:
+        valid = sorted(set(_SOURCE_BY_TOKEN) | {"all"})
+        raise ValueError(f"unknown --sources token(s) {unknown!r}; valid: {valid}")
+    if not out:
+        return ALL_SOURCES
+    return frozenset(out)
 
 def _resolve_fixtures_dir() -> Path:
     """Find fixtures/alerts/ across install layouts.
@@ -81,6 +123,24 @@ def _fmt_repo(r: RepoProfile) -> str:
 
 
 def _fmt_alert_header(a: Alert) -> str:
+    """v2: source-aware header.
+
+    Dependabot: #N pkg (ecosystem/scope) — CVE severity=X state=Y
+    CodeQL:     #N [code-scanning] rule_id @ path:line — severity=X state=Y
+    Secret:     #N [secret] secret_type — severity=critical state=Y
+    """
+    if a.source is AlertSource.CODE_SCANNING:
+        loc = f"{a.location_path or '?'}:{a.location_line or '?'}"
+        return (
+            f"    #{a.number} [code-scanning] {a.rule_id or '?'} @ {loc} "
+            f"— severity={a.severity} state={a.state}"
+        )
+    if a.source is AlertSource.SECRET_SCANNING:
+        return (
+            f"    #{a.number} [secret] {a.secret_type or '?'} "
+            f"— severity={a.severity} state={a.state}"
+        )
+    # Default = Dependabot (matches v1 output verbatim)
     cve = a.cve_id or a.ghsa_id or "?"
     return (
         f"    #{a.number} {a.package_name} ({a.package_ecosystem}/{a.scope}) "
@@ -223,7 +283,10 @@ def _route_and_print(
                     print(f"      (fixture expects: {expected})")
                 continue
 
-            print("      [Z1 continue] → Zone 2 investigation")
+            if a.source is AlertSource.SECRET_SCANNING:
+                print("      [Z1 continue] → Z4 short-circuit (secret scanning)")
+            else:
+                print("      [Z1 continue] → Zone 2 investigation")
             cont += 1
             _process_alert(a, s.repo, client, flags)
             expected = a.meta.get("expected_verdict")
@@ -238,12 +301,42 @@ def _process_alert(
     client: GitHubClient | OfflineGitHubClient,
     flags: CycleFlags,
 ) -> Verdict:
-    """Z2 + Z3 + Z4 with at most one Prosecutor-requested recompute."""
+    """Z2 + Z3 + Z4 with at most one Prosecutor-requested recompute.
+
+    v2 short-circuit: secret scanning alerts bypass Z2/Z3 entirely. They go
+    from Z1 straight to Z4 with a ROTATE_NOW verdict. No advisory, no
+    evidence, no truth table, no judge, no prosecutor, no critic. The
+    Consistency Gate and history still apply (we don't duplicate Issues for
+    the same secret), but the verdict cannot flip.
+    """
+    if a.source is AlertSource.SECRET_SCANNING:
+        return _process_secret_alert(a, repo, client, flags)
     verdict, want_recompute = _run_pipeline_once(a, repo, client, flags, is_recomputed=False)
     if want_recompute:
         print("      [Z3 prosecutor] requesting evidence recompute (one-shot allowed)")
         verdict, _ = _run_pipeline_once(a, repo, client, flags, is_recomputed=True)
     return verdict
+
+
+def _process_secret_alert(
+    a: Alert,
+    repo: RepoProfile,
+    client: GitHubClient | OfflineGitHubClient,
+    flags: CycleFlags,
+) -> Verdict:
+    """Z1 → Z4 short-circuit for secret scanning. No LLM, no judgment."""
+    print("      [Z2 SKIPPED] secret scanning — no investigation, no judgment")
+    v = build_rotate_now_verdict(a)
+    print(
+        f"      [Z3 verdict: ROTATE_NOW] confidence={v.confidence:.2f} "
+        f"source={v.source}"
+    )
+    print(f"        \"{v.human_conclusion}\"")
+    # Use a synthetic Tier classification at INTERNAL — the secret pipeline
+    # does not consult tier floors for dismiss (dismiss is structurally
+    # blocked), but the Critic and history append still want a value.
+    tier = TierClassification.for_tier(Tier.INTERNAL, reason="secret scanning bypass — tier is informational only")
+    return _finalize(a, repo, v, tier, client, flags)
 
 
 def _run_pipeline_once(
@@ -258,17 +351,32 @@ def _run_pipeline_once(
     prefix = "  [recompute]" if is_recomputed else ""
     offline = isinstance(client, OfflineGitHubClient)
 
-    adv = extract_vulnerable_apis(a)
-    if offline:
-        em = collect_evidence_offline(a, repo, advisory_apis=adv.apis)
+    # v2: source-dependent Advisory + Evidence build.
+    if a.source is AlertSource.DEPENDABOT:
+        adv = extract_vulnerable_apis(a)
+        if offline:
+            em = collect_evidence_offline(a, repo, advisory_apis=adv.apis)
+        else:
+            em = collect_evidence_online(a, repo, client, advisory_apis=adv.apis)  # type: ignore[arg-type]
+        available_str = "yes" if adv.available else "no"
+        print(
+            f"      [Z2 advisory{prefix}] llm_available={available_str} "
+            f"apis={list(adv.apis)} ({adv.note})"
+        )
+        print(_fmt_evidence(em))
     else:
-        em = collect_evidence_online(a, repo, client, advisory_apis=adv.apis)  # type: ignore[arg-type]
-    available_str = "yes" if adv.available else "no"
-    print(
-        f"      [Z2 advisory{prefix}] llm_available={available_str} "
-        f"apis={list(adv.apis)} ({adv.note})"
-    )
-    print(_fmt_evidence(em))
+        # CodeQL: the rule.description IS the advisory; no extraction needed.
+        # Secret scanning: never reaches here in v2-4+ (Z1 short-circuits).
+        print(
+            f"      [Z2 advisory{prefix}] N/A for source={a.source.value} "
+            f"(rule already names the finding)"
+        )
+        em = empty_evidence_for_non_dependabot(a)
+        print(
+            f"      [Z2 evidence] source={a.source.value} "
+            f"rule={a.rule_id or '—'} "
+            f"location={a.location_path or '—'}:{a.location_line or '—'}"
+        )
 
     tier_override = _tier_override_from_meta(a) if offline else None
     tt = preflight(a, repo, em, tier_override=tier_override)
@@ -344,14 +452,25 @@ def run_offline(flags: CycleFlags | None = None) -> int:
     client = OfflineGitHubClient(FIXTURES_DIR)
     try:
         with client:
-            sets = client.load_repo_alert_sets()
+            sets = client.load_repo_alert_sets(sources=flags.sources)
             if not sets:
-                print(f"[offline] no fixtures found under {FIXTURES_DIR}", file=sys.stderr)
+                if flags.sources != ALL_SOURCES:
+                    sources_str = ",".join(sorted(s.value for s in flags.sources))
+                    print(
+                        f"[offline] no fixtures matching sources={{{sources_str}}} "
+                        f"under {FIXTURES_DIR}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"[offline] no fixtures found under {FIXTURES_DIR}", file=sys.stderr)
                 return 1
             total = sum(len(s.alerts) for s in sets)
+            sources_str = ",".join(sorted(s.value for s in flags.sources))
             print(
                 f"[offline] loaded {total} alert(s) across {len(sets)} synthetic repo(s) "
-                f"from {FIXTURES_DIR}  flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}}}"
+                f"from {FIXTURES_DIR}  "
+                f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
+                f"sources={sources_str}}}"
             )
             fast, cont = _route_and_print(sets, client, flags)
     except Exception as e:
@@ -387,7 +506,13 @@ def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
     with client:
         try:
             repo = client.get_repo(owner, name)
-            alerts = client.list_dependabot_alerts(owner, name)
+            alerts: list[Alert] = []
+            if AlertSource.DEPENDABOT in flags.sources:
+                alerts.extend(client.list_dependabot_alerts(owner, name))
+            if AlertSource.CODE_SCANNING in flags.sources:
+                alerts.extend(client.list_code_scanning_alerts(owner, name))
+            if AlertSource.SECRET_SCANNING in flags.sources:
+                alerts.extend(client.list_secret_scanning_alerts(owner, name))
         except Exception as e:
             print(
                 f"[Z1 error note] GitHub fetch failed for {repo_arg}: "
@@ -396,9 +521,17 @@ def run_online(repo_arg: str, flags: CycleFlags | None = None) -> int:
             )
             return 3
         sets = [RepoAlertSet(repo, alerts)]
+        sources_str = ",".join(sorted(s.value for s in flags.sources))
+        # Per-source breakdown so the operator can see what came back.
+        by_src = {s.value: 0 for s in flags.sources}
+        for a in alerts:
+            by_src[a.source.value] = by_src.get(a.source.value, 0) + 1
+        breakdown = ",".join(f"{k}={v}" for k, v in sorted(by_src.items()))
         print(
-            f"[online] {len(alerts)} open alert(s) in {repo.full_name}  "
-            f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}}}"
+            f"[online] {len(alerts)} open alert(s) in {repo.full_name} "
+            f"[{breakdown}]  "
+            f"flags={{dry_run={flags.dry_run}, auto_transition={flags.auto_transition}, "
+            f"sources={sources_str}}}"
         )
         fast, cont = _route_and_print(sets, client, flags)
     print(
@@ -438,8 +571,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-transition",
         action="store_true",
         help=(
-            "Auto-dismiss Dependabot alerts judged false_positive above the tier's "
-            "transition floor. Tier-1 (critical) repos are NEVER auto-dismissed."
+            "Auto-dismiss alerts judged false_positive above the tier's transition "
+            "floor. Tier-1 (critical) repos are NEVER auto-dismissed. Secret scanning "
+            "alerts are NEVER auto-dismissed regardless of flag (humans rotate)."
+        ),
+    )
+    p.add_argument(
+        "--sources",
+        default="dependabot",
+        metavar="LIST",
+        help=(
+            "Comma-separated alert sources to ingest. Tokens: dependabot, "
+            "code-scanning (alias: codeql), secret-scanning (alias: secret). "
+            "Use 'all' for the three of them. Default: dependabot (v1 compat)."
         ),
     )
     return p
@@ -447,7 +591,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    flags = CycleFlags(dry_run=args.dry_run, auto_transition=args.auto_transition)
+    try:
+        sources = _parse_sources(args.sources)
+    except ValueError as e:
+        print(f"[args] {e}", file=sys.stderr)
+        return 2
+    flags = CycleFlags(
+        dry_run=args.dry_run,
+        auto_transition=args.auto_transition,
+        sources=sources,
+    )
     if args.offline:
         return run_offline(flags)
     if args.repo:

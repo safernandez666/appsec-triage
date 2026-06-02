@@ -43,6 +43,30 @@ LOCKFILES_BY_ECOSYSTEM: dict[str, tuple[str, ...]] = {
 }
 
 
+def empty_evidence_for_non_dependabot(alert: Alert) -> EvidenceMatrix:
+    """v2: build a minimal EvidenceMatrix for sources that do not use the
+    Dependabot-style reachability flow.
+
+    CodeQL: the rule already names what is vulnerable and where. There is no
+    package/version range to map onto code search, and there are no API
+    symbols to look up. We still produce an EvidenceMatrix so the rest of
+    the pipeline (Truth Table dispatch, Judge prompt, Prosecutor checks) has
+    something to consume — but every count is 0 and every boolean reflects
+    "we did not look".
+    """
+    from triage.types import AlertSource
+    ecosystem = (
+        "code-scanning" if alert.source is AlertSource.CODE_SCANNING
+        else alert.source.value
+    )
+    return EvidenceMatrix(
+        package_name=alert.rule_id or (alert.summary[:40] if alert.summary else "?"),
+        ecosystem=ecosystem,
+        direct_package_hits=0,
+        vuln_api_hits=0,
+    )
+
+
 def collect_evidence_offline(
     alert: Alert,
     repo: RepoProfile,

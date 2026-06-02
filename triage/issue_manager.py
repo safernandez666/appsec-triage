@@ -25,16 +25,24 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from triage.consistency import ConsistencyAction, ConsistencyDecision
+from triage.secret_scanning import build_issue_body as build_secret_issue_body
 from triage.truth_table import TierClassification
-from triage.types import Alert, RepoProfile, Tier, Verdict, VerdictKind
+from triage.types import Alert, AlertSource, RepoProfile, Tier, Verdict, VerdictKind
 
 ISSUE_LABEL = "autotriage"
+_ALL_SOURCES: frozenset[AlertSource] = frozenset(AlertSource)
 
 
 @dataclass(frozen=True)
 class CycleFlags:
     dry_run: bool = False
     auto_transition: bool = False
+    # v2: subset of sources to ingest this cycle. Default = all three.
+    # `dataclass(frozen=True)` + mutable default would crash, so we use a
+    # frozenset assigned via default_factory through __post_init__-less
+    # pattern: callers always pass explicitly, and the default here is just
+    # the safe "everything" superset.
+    sources: frozenset[AlertSource] = _ALL_SOURCES
 
 
 @dataclass(frozen=True)
@@ -148,11 +156,25 @@ def _maybe_dismiss(
     In every other case there's something worth saying — auto-transition off,
     guardrail block, confidence below floor, dry-run, or the actual DISMISS.
     Whether the dismiss actually happened is in the bool, not the kind string.
+
+    v2: Secret scanning alerts NEVER reach here for auto-dismiss — Z1
+    short-circuits them. As a defense in depth, the source check below also
+    refuses to act on them.
     """
     if verdict.kind is not VerdictKind.FALSE_POSITIVE:
         return False, None
     if not flags.auto_transition:
         return False, "--auto-transition off, no dismiss attempted"
+
+    # v2 GUARDRAIL — Secret scanning is never auto-dismissed. Humans rotate.
+    # Belt + suspenders: this is also enforced structurally because the client
+    # exposes no dismiss method for secret scanning, but we check here too in
+    # case some future caller wires up a dismiss path by accident.
+    if alert.source is AlertSource.SECRET_SCANNING:
+        return False, (
+            "GUARDRAIL: secret scanning alerts are never auto-dismissed — "
+            "humans must confirm rotation"
+        )
 
     # GUARDRAIL — non-negotiable. Tier 1 repos are never auto-dismissed,
     # full stop. Belt + suspenders with the float("inf") transition floor.
@@ -168,22 +190,44 @@ def _maybe_dismiss(
             f"{tier.transition_floor:.2f}; no dismiss"
         )
 
-    reason = _dismiss_reason(verdict)
+    reason = _dismiss_reason(verdict, alert)
     if flags.dry_run:
-        return False, f"DRY-RUN would dismiss Dependabot alert #{alert.number} reason={reason}"
+        label = "Dependabot alert" if alert.source is AlertSource.DEPENDABOT else "code-scanning alert"
+        return False, f"DRY-RUN would dismiss {label} #{alert.number} reason='{reason}'"
+
+    # v2: route to the source-specific dismiss method on the client.
+    if alert.source is AlertSource.CODE_SCANNING:
+        client.dismiss_code_scanning_alert(  # type: ignore[attr-defined]
+            repo.owner, repo.name, alert.number,
+            reason, comment=verdict.human_conclusion[:140],
+        )
+        return True, f"DISMISSED code-scanning alert #{alert.number} reason='{reason}'"
     client.dismiss_alert(
         repo.owner, repo.name, alert.number,
         reason, comment=verdict.human_conclusion[:140],
     )
-    return True, f"DISMISSED Dependabot alert #{alert.number} reason={reason}"
+    return True, f"DISMISSED Dependabot alert #{alert.number} reason='{reason}'"
 
 
-def _dismiss_reason(verdict: Verdict) -> str:
+def _dismiss_reason(verdict: Verdict, alert: Alert) -> str:
+    """Pick the right dismiss vocabulary for the alert's source.
+
+    Dependabot vocabulary: {not_used, inaccurate, tolerable_risk}.
+        - Truth Table rules that fire on "no usage detected" → `not_used`.
+        - Everything else → `inaccurate`. Never `tolerable_risk` automatically.
+    Code scanning vocabulary: {"false positive", "won't fix", "used in tests"}.
+        - Truth Table `codeql_in_tests` → "used in tests".
+        - Truth Table `codeql_archived` → "won't fix" (the code is frozen).
+        - Everything else FP → "false positive".
+    """
     src = verdict.source or ""
-    # Truth Table rules that fire on "no usage detected" map cleanly to `not_used`.
-    # Everything else (Judge or forced rules with different sources) → `inaccurate`,
-    # which is the safest non-`tolerable_risk` reason. We never use
-    # `tolerable_risk` automatically — that is a human policy decision.
+    if alert.source is AlertSource.CODE_SCANNING:
+        if "codeql_in_tests" in src:
+            return "used in tests"
+        if "codeql_archived" in src:
+            return "won't fix"
+        return "false positive"
+    # Dependabot
     if src.startswith("truth_table:") and "no_hits" in src:
         return "not_used"
     return "inaccurate"
@@ -211,6 +255,24 @@ def _find_existing(
 
 
 def _build_issue_body(alert: Alert, verdict: Verdict, marker: str) -> str:
+    """Source-aware Issue body builder.
+
+    Dependabot:    package + advisory + manifest + triage conclusion.
+    Code scanning: rule + location + conclusion.
+    Secret:        URGENT body with rotation steps — built by triage.secret_scanning.
+    """
+    if alert.source is AlertSource.SECRET_SCANNING:
+        return build_secret_issue_body(alert, marker)
+    if alert.source is AlertSource.CODE_SCANNING:
+        return (
+            f"{marker}\n\n"
+            f"**Rule:** `{alert.rule_id or '?'}` (severity={alert.severity})\n"
+            f"**Location:** `{alert.location_path or '?'}:{alert.location_line or '?'}`\n"
+            f"**Analyzer:** {alert.raw.get('tool', {}).get('name', 'code-scanning')}\n"
+            f"**Alert:** {alert.html_url}\n"
+            f"\n---\n\n### Triage conclusion\n\n{verdict.human_conclusion}\n"
+        )
+    # Default = Dependabot
     cve = alert.cve_id or alert.ghsa_id
     patched = alert.first_patched_version or "unknown"
     return (

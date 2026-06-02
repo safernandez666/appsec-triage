@@ -8,7 +8,7 @@
 
 Triaje defensivo multi-agente de alertas de Dependabot. Reduce los falsos positivos y la fatiga de alertas del equipo. GitHub-native. Python 3.11+. Única dependencia runtime: `httpx`.
 
-> **Estado:** Proof of Concept. v1 consume solo alertas de Dependabot. CodeQL y secret scanning están documentados como [extension hooks](#extensiones-para-v2) para v2.
+> **Estado:** v0.2.0. Ingiere tres fuentes: Dependabot, GitHub Code Scanning (CodeQL + SAST de terceros), y Secret Scanning. Ver [Fuentes](#fuentes).
 
 ## Por qué existe
 
@@ -140,28 +140,43 @@ Exit codes: `0` ok · `1` input vacío · `2` error de argumentos o auth · `3` 
 ## Limitaciones (PoC)
 
 - **`/search/code` solo indexa la rama por default y archivos menores a 384 KB.** Código en feature branches, en subtrees vendored, o en archivos generados grandes es invisible para la alcanzabilidad. La Truth Table trata la ausencia de hits como evidencia solo bajo condiciones explícitas; al Judge se le informa del caveat en su prompt.
-- v1 consume solo alertas de Dependabot. CodeQL y secret scanning están documentados como hooks para v2.
+- v2 ingiere Dependabot, CodeQL/SAST y Secret Scanning. Fuentes nuevas (Dependency Review API en PR time, attestations de supply chain, telemetría de runtime) no están wireadas.
 - El endpoint del LLM tiene que hablar la API de chat completions de OpenAI. Cualquier cosa que no la hable (API cruda de Anthropic, Bedrock InvokeModel) necesita un adapter delgado.
 - La persistencia del historial en CI es solo via artifact. Ver [Memoria](#memoria-y-consenso-org-wide).
 - El auto-feedback queda excluido pero el coupling cross-org no está modelado. Si tu "org" tiene subgrupos con posturas de riesgo distintas, particioná el archivo de historial por grupo.
 
-## Extensiones para v2
+## Fuentes
 
-Dos extension hooks viven justo después de la resolución de fuente en Zona 1. Ambos están deliberadamente sin wirear:
+Tres señales de seguridad de GitHub, tres modelos de riesgo. Elegís qué ingestar con `--sources` (`dependabot` | `code-scanning` (alias `codeql`) | `secret-scanning` (alias `secret`) | `all` | lista separada por coma). Default = `dependabot` para compat con v1.
 
-### Alertas de CodeQL
+### Dependabot
 
-- Extender `GitHubClient` con `list_code_scanning_alerts(owner, name)` apuntando a `/repos/{o}/{r}/code-scanning/alerts`.
-- Agregar un classmethod `Alert.from_code_scanning_payload` que llene el mismo shape plano (el resto del pipeline es agnostic).
-- Extender la `EvidenceMatrix` para llevar señales específicas de CodeQL (rule id, location, dataflow class). El prompt del Judge crece una sección; las reglas de la Truth Table se pueden dejar o agregarles análogos CodeQL.
-- Reusar Advisory + Judge + Prosecutor + Critic + Consistency sin cambios.
+Pipeline Z1 → Z2 → Z3 → Z4 completo. Las Truth Table Rules A (`archived AND no hits`) y B (`advisory APIs AND no hits AND repo representativo`) pueden forzar `false_positive` sin invocar al Judge. El consenso org-wide sobre `(CVE+package)` funciona entre repositorios de la misma org. Vocabulario de dismiss: `not_used` / `inaccurate` / `tolerable_risk` (este último **nunca** se elige automáticamente).
 
-### Alertas de Secret scanning
+### Code Scanning (CodeQL + SAST de terceros)
 
-- Modelo de riesgo distinto: no existe la pregunta "¿es reproducible?" — un secreto leakeado quedó leakeado.
-- **Short-circuit** en Z1 routing: una alerta nueva de secret scanning → abrir una Issue de "rotate now" con la location del leak y qué tipo de secreto, sin involucrar al LLM, sin Truth Table, sin Prosecutor.
-- La Consistency Gate sigue aplicando (SKIP si el mismo secreto ya fue reportado).
-- Auto-transition queda permanentemente off para esta fuente — los humanos tienen que confirmar la rotación.
+Misma forma del pipeline pero **la pregunta es distinta**: "¿este finding es accionable en este repo?" en lugar de "¿esta dependencia afecta a este repo?".
+
+- El Advisory Agent se saltea (la rule ya nombra lo que está vulnerable).
+- El Evidence Agent se reemplaza por la metadata de location de la alerta misma.
+- Dos rules de Truth Table únicas para CodeQL:
+  - **Rule C** — `location_path` dentro de un directorio de tests (`tests/`, `__tests__/`, `spec/`, `e2e/`, …) → `false_positive`. Los findings de SAST adentro de scaffolding de tests no son explotables desde runtime.
+  - **Rule D** — repo archivado → `false_positive` (análoga a la Rule A de Dependabot).
+- El prompt del Judge es un archivo distinto (`JUDGE_SYSTEM_PROMPT_CODE_SCANNING`) para que el modelo encuadre su razonamiento alrededor de la alcanzabilidad del patrón de la rule, no del uso de dependencias.
+- Vocabulario de dismiss: `"false positive"` / `"won't fix"` / `"used in tests"` (notar los espacios — es el contrato de la API de CodeQL).
+
+### Secret Scanning — short-circuit
+
+**Modelo de riesgo completamente distinto.** Una credencial leakeada está leakeada; no hay pregunta de "¿es reproducible?" para responder. El pipeline colapsa a:
+
+```
+Z1 routing  →  Z4 output  (sin Z2, sin Z3, sin LLM)
+```
+
+- `VerdictKind.ROTATE_NOW` es el único veredicto que una secret alert puede tener. `confidence=1.0` — esto es estructural, no probabilístico.
+- El body de la Issue es un template urgente "rotate now" con pasos de rotación, la location del leak, el commit SHA, y un recordatorio explícito de que sacar el secret de la historia de git no es suficiente (puede haber sido scrapeado ya).
+- Auto-dismiss es **estructuralmente imposible** para esta fuente: (1) el `GitHubClient` no expone método `dismiss_secret_scanning_alert`, (2) `issue_manager._maybe_dismiss` short-circuitea con `GUARDRAIL: secret scanning alerts are never auto-dismissed`. Cinturón + tiradores.
+- La Consistency Gate sigue aplicando — un secret re-detectado da SKIP, no una Issue duplicada.
 
 ## Estructura del proyecto
 
@@ -178,11 +193,12 @@ appsec-triage/
 │   ├── evidence_agent.py        # Z2 deterministic facts (counts + booleans)
 │   ├── truth_table.py           # Z2 tier + forced verdicts (Rules A/B)
 │   ├── memory.py                # org-wide consensus reader (≥3 other repos)
-│   ├── judge.py                 # Z3 LLM Judge, strict JSON contract
+│   ├── judge.py                 # Z3 LLM Judge, strict JSON contract (per-source prompts)
 │   ├── prosecutor.py            # Z3 adversarial — deterministic + LLM attack
 │   ├── critic.py                # Z3 silent quality gate (tier floor)
 │   ├── consistency.py           # Z3 anti flip-flop + history append
-│   └── issue_manager.py         # Z4 Issue + Dependabot dismiss + tier-1 guardrail
+│   ├── secret_scanning.py       # v2: Z1→Z4 short-circuit + rotate-now Issue body
+│   └── issue_manager.py         # Z4 Issue + source-aware dismiss + tier-1 guardrail
 ├── fixtures/alerts/             # offline demo data
 ├── docs/                        # diagrams (architecture.svg + sequence.svg + HTML versions)
 ├── .github/workflows/triage.yml # cron + workflow_dispatch
