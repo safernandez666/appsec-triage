@@ -37,6 +37,7 @@ from triage.evidence_agent import (
 from triage.github_client import GitHubClient, OfflineGitHubClient, RepoAlertSet
 from triage.issue_manager import (
     CycleFlags,
+    ISSUE_LABEL,
     IssueAction,
     handle as handle_issue,
     handle_fast_path_close,
@@ -184,7 +185,7 @@ def _tally_action(ia: IssueAction) -> None:
 def _fmt_summary(prefix: str = "[cycle]") -> str:
     """Render verdict and action counters as two aligned, colored lines."""
     v_order = ("false_positive", "reproducible", "needs_review", "rotate_now")
-    a_order = ("create", "comment", "skip", "close", "dismiss")
+    a_order = ("create", "comment", "skip", "close", "dismiss", "blocked")
     v_parts = [
         f"{n} {col.verdict(k, k, strong=False)}"
         for k in v_order
@@ -638,7 +639,17 @@ def _finalize(
     _vprint(_fmt_critic(v, critiqued))
     decision = evaluate_consistency(critiqued, repo, a, HISTORY_PATH)
     _vprint(_fmt_consistency(decision))
-    append_history(HISTORY_PATH, repo, a, critiqued)
+    # History is part of the side-effect surface — it drives the Consistency
+    # Gate on subsequent runs, and feeds the org-wide false-positive consensus
+    # check. Dry-run mode must leave it untouched, otherwise a `--dry-run`
+    # rehearsal silently teaches the bot "we already handled these alerts"
+    # and the next real run will SKIP them via consistency. The original
+    # design wrote to history unconditionally; that bit us against
+    # safernandez666/Controls where 25 reproducible XSS verdicts had been
+    # recorded by dry-runs and a subsequent live run created 0 Issues for
+    # them. Same gate as Issue creation: respect dry-run.
+    if not flags.dry_run:
+        append_history(HISTORY_PATH, repo, a, critiqued)
     ia = handle_issue(client, repo, a, critiqued, tier, decision, flags)
     _vprint(_fmt_issue_action(ia))
     _tally_verdict(critiqued)
@@ -775,6 +786,21 @@ def _process_single_repo_online(
         with client:
             try:
                 repo = client.get_repo(owner, name)
+                # Ensure the autotriage label exists before any Issue is created.
+                # Without this, GitHub silently drops the label on Issue create,
+                # and `_find_existing`'s label-filtered query returns nothing →
+                # duplicate Issues on every CREATE. Idempotent (no-op on 422).
+                if not flags.dry_run:
+                    try:
+                        client.ensure_label(owner, name, ISSUE_LABEL)
+                    except Exception as e:
+                        # Don't fail the cycle for a label-create permission
+                        # issue — the dedupe fallback still works.
+                        print(
+                            f"[warn] could not ensure label {ISSUE_LABEL!r}: "
+                            f"{type(e).__name__}: {e}",
+                            file=sys.stderr,
+                        )
                 alerts: list[Alert] = []
                 if AlertSource.DEPENDABOT in flags.sources:
                     alerts.extend(client.list_dependabot_alerts(owner, name))

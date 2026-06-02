@@ -54,11 +54,12 @@ class IssueAction:
 
 class _IssuesAndAlertsClient(Protocol):
     """Minimal slice of GitHubClient/OfflineGitHubClient used here."""
-    def list_issues(self, owner: str, name: str, *, label: str, state: str = "open") -> list[dict]: ...
+    def list_issues(self, owner: str, name: str, *, label: str | None = None, state: str = "open") -> list[dict]: ...
     def create_issue(self, owner: str, name: str, title: str, body: str, labels: list[str] | tuple[str, ...] = ()) -> int: ...
     def add_comment(self, owner: str, name: str, issue_number: int, body: str) -> int: ...
     def close_issue(self, owner: str, name: str, issue_number: int) -> bool: ...
     def dismiss_alert(self, owner: str, name: str, number: int, reason: str, comment: str = "") -> bool: ...
+    def ensure_label(self, owner: str, name: str, label: str) -> None: ...
 
 
 def marker_for(alert: Alert) -> str:
@@ -135,22 +136,43 @@ def handle(
         if flags.dry_run:
             issue_number: int | None = None
             issue_log = f"DRY-RUN would create Issue: title='{issue_title(alert)}', label={ISSUE_LABEL}"
+            primary_kind = "create"
         else:
-            issue_number = client.create_issue(
-                repo.owner, repo.name, issue_title(alert), body, labels=[ISSUE_LABEL],
-            )
-            issue_log = f"created Issue #{issue_number}"
-        primary_kind = "create"
+            try:
+                issue_number = client.create_issue(
+                    repo.owner, repo.name, issue_title(alert), body, labels=[ISSUE_LABEL],
+                )
+                issue_log = f"created Issue #{issue_number}"
+                primary_kind = "create"
+            except Exception as e:
+                # Permission error or any other create failure should not
+                # crash the whole cycle — record it and move on. Common
+                # cause: fine-grained PAT lacks `Issues: write`.
+                issue_number = None
+                issue_log = f"failed to create Issue: {type(e).__name__}: {e}"
+                primary_kind = "blocked"
     else:
         comment_body = _build_comment(verdict, decision)
         if flags.dry_run:
             issue_number = existing
             issue_log = f"DRY-RUN would comment on existing Issue #{existing}"
+            primary_kind = "comment"
         else:
-            client.add_comment(repo.owner, repo.name, existing, comment_body)
-            issue_number = existing
-            issue_log = f"commented on existing Issue #{existing}"
-        primary_kind = "comment"
+            try:
+                client.add_comment(repo.owner, repo.name, existing, comment_body)
+                issue_number = existing
+                issue_log = f"commented on existing Issue #{existing}"
+                primary_kind = "comment"
+            except Exception as e:
+                # Same rationale as create above. A 403 on comments has
+                # been observed when the PAT has Issues: read+create but
+                # not the comment scope; log and continue.
+                issue_number = existing
+                issue_log = (
+                    f"failed to comment on Issue #{existing}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                primary_kind = "blocked"
 
     dismissed, transition_log = _maybe_dismiss(client, repo, alert, verdict, tier, flags)
     if transition_log is None:
@@ -257,10 +279,41 @@ def _find_existing(
     *,
     state: str = "open",
 ) -> int | None:
+    """Locate the existing autotriage Issue for `marker` via two queries.
+
+    History: this used to filter by `label=ISSUE_LABEL`. That was efficient
+    when the label always existed, but every freshly-bootstrapped repo
+    failed silently — the label did not exist yet at the first create, so
+    GitHub dropped it, then `_find_existing` filtered by a label no Issue
+    carried and returned None. Every subsequent create produced another
+    duplicate. We now try the labeled query first (fast path on
+    well-bootstrapped repos) and fall back to a full scan when it returns
+    nothing. The cycle-start `ensure_label` keeps the fast path hitting
+    on subsequent runs.
+    """
+    candidates: list[dict] = []
     try:
-        issues = client.list_issues(repo.owner, repo.name, label=ISSUE_LABEL, state=state)
+        candidates = client.list_issues(
+            repo.owner, repo.name, label=ISSUE_LABEL, state=state,
+        )
+    except Exception:
+        candidates = []
+    found = _match_marker(candidates, marker)
+    if found is not None:
+        return found
+    # Fallback: scan all Issues regardless of label. Slower (one extra page
+    # of /repos/{o}/{r}/issues) but the marker is unique per alert identity
+    # so a false match is structurally impossible.
+    try:
+        all_open = client.list_issues(
+            repo.owner, repo.name, label=None, state=state,
+        )
     except Exception:
         return None
+    return _match_marker(all_open, marker)
+
+
+def _match_marker(issues: list[dict], marker: str) -> int | None:
     for i in issues:
         body = i.get("body") or ""
         if marker in body:

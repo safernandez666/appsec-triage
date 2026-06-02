@@ -196,13 +196,51 @@ class GitHubClient:
 
     # ---- Issues ----------------------------------------------------------
 
-    def list_issues(self, owner: str, name: str, *, label: str, state: str = "open") -> list[dict]:
-        r = self._client.get(
-            f"/repos/{owner}/{name}/issues",
-            params={"labels": label, "state": state, "per_page": 100},
-        )
+    def list_issues(
+        self,
+        owner: str,
+        name: str,
+        *,
+        label: str | None = None,
+        state: str = "open",
+    ) -> list[dict]:
+        """List Issues. `label=None` means no label filter — needed by
+        `_find_existing` so the marker-based dedupe still works on repos
+        where the `autotriage` label was never applied (e.g. because it
+        did not exist yet at the time of the first create)."""
+        params: dict[str, str | int] = {"state": state, "per_page": 100}
+        if label is not None:
+            params["labels"] = label
+        r = self._client.get(f"/repos/{owner}/{name}/issues", params=params)
         r.raise_for_status()
         return r.json()
+
+    def ensure_label(
+        self,
+        owner: str,
+        name: str,
+        label: str,
+        *,
+        color: str = "d97706",
+        description: str = "Created by appsec-triage bot.",
+    ) -> None:
+        """Create `label` on the repo if it does not already exist.
+
+        Idempotent: GitHub returns 422 when the label already exists; we
+        swallow that single case and return. Any other failure raises so
+        the operator notices auth or permission problems immediately.
+
+        The triage Issues lookup historically filtered by this label,
+        and a missing label silently broke dedupe — every create produced
+        a new duplicate Issue. Calling this once per repo at cycle start
+        prevents that silent regression."""
+        r = self._client.post(
+            f"/repos/{owner}/{name}/labels",
+            json={"name": label, "color": color, "description": description},
+        )
+        if r.status_code == 422:
+            return  # already exists
+        r.raise_for_status()
 
     def create_issue(
         self,
@@ -285,12 +323,33 @@ class OfflineGitHubClient:
 
     # ---- Issue stubs (in-memory) ----------------------------------------
 
-    def list_issues(self, owner: str, name: str, *, label: str, state: str = "open") -> list[dict]:
+    def list_issues(
+        self,
+        owner: str,
+        name: str,
+        *,
+        label: str | None = None,
+        state: str = "open",
+    ) -> list[dict]:
         return [
             i for i in self._issues.get((owner, name), [])
             if (state == "all" or i.get("state", "open") == state)
-            and label in i.get("labels", [])
+            and (label is None or label in i.get("labels", []))
         ]
+
+    def ensure_label(
+        self,
+        owner: str,
+        name: str,
+        label: str,
+        *,
+        color: str = "d97706",
+        description: str = "Created by appsec-triage bot.",
+    ) -> None:
+        """No-op in offline mode — there is no labels API and the in-memory
+        Issue store does not enforce label existence. Method exists so the
+        cycle-start ensure_label call works regardless of client type."""
+        return None
 
     def create_issue(
         self,

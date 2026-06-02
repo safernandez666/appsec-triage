@@ -162,4 +162,8 @@ def action(kind: str) -> str:
         return _wrap(upper, _GRAY)
     if base == "skip":
         return _wrap(upper, _GRAY)
+    if base == "blocked":
+        # Permission error / soft fail — yellow-ish to draw attention
+        # without being as alarming as the red "CONTRADICTION" code.
+        return _wrap(upper, BOLD + _SEV_HIGH)
     return upper
