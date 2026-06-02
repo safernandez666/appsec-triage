@@ -1,0 +1,39 @@
+{
+  "number": 303,
+  "state": "fixed",
+  "dependency": {
+    "package": {"ecosystem": "pip", "name": "urllib3"},
+    "manifest_path": "requirements.txt",
+    "scope": "runtime"
+  },
+  "security_advisory": {
+    "ghsa_id": "GHSA-r64q-w8jr-g9qp",
+    "cve_id": "CVE-2023-43804",
+    "summary": "urllib3's Cookie header isn't stripped during cross-origin redirects",
+    "description": "urllib3 doesn't treat the Cookie HTTP header special or provide any helpers for managing cookies. As such, if a user is making requests with a Cookie header that should not be sent to a redirected origin (e.g. due to a cross-origin redirect), the cookie may be leaked. Affects urllib3 prior to 1.26.17 and 2.0.6.",
+    "severity": "medium"
+  },
+  "security_vulnerability": {
+    "package": {"ecosystem": "pip", "name": "urllib3"},
+    "vulnerable_version_range": "< 1.26.17",
+    "first_patched_version": {"identifier": "1.26.17"}
+  },
+  "created_at": "2024-06-10T08:00:00Z",
+  "html_url": "https://github.com/example-org/active-service/security/dependabot/303",
+  "_meta": {
+    "expected_verdict": "fast-path: close (already fixed)",
+    "expected_reason": "Z1 routing fast-path: state=fixed; no Zone 2/3, no LLM",
+    "repo_profile_hint": {
+      "owner": "example-org",
+      "name": "active-service",
+      "archived": false,
+      "language": "Python",
+      "age_days": 600,
+      "tier": 2
+    },
+    "code_search_hint": {
+      "direct_package_hits": 8,
+      "vuln_api_hits": 0
+    }
+  }
+}

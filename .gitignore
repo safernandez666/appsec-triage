@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+.triage_history.jsonl
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Ruflo tooling state (lives in the parent dir; this stray subdir is unrelated to the bot)
+.claude-flow/

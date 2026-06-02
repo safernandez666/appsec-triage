@@ -1,0 +1,102 @@
+name: AppSec triage
+
+# Defensive triage of Dependabot alerts. Runs daily on cron; can be triggered
+# on-demand via workflow_dispatch with explicit `auto_transition` / `dry_run`
+# inputs so an operator can force a read-only cycle from the UI.
+
+on:
+  schedule:
+    # 08:00 UTC daily. Adjust per timezone of the team that will review the
+    # Issues this workflow files.
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Target repo as owner/name. Defaults to this repository.'
+        required: false
+        type: string
+      auto_transition:
+        description: 'Auto-dismiss false_positive Dependabot alerts (tier-1 always blocked).'
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: 'Compute verdicts but mutate nothing (no Issue posts, no dismisses).'
+        required: false
+        default: false
+        type: boolean
+
+# Minimum permissions for the embedded GITHUB_TOKEN.
+# - security-events: write   PATCH /dependabot/alerts/{n} (dismiss)
+# - issues: write             POST  /issues + /issues/{n}/comments + close
+# - contents: read            checkout
+permissions:
+  contents: read
+  issues: write
+  security-events: write
+
+# Prevent overlapping triage cycles on the same workflow file. We do NOT
+# cancel-in-progress: triage should run to completion so history stays
+# consistent.
+concurrency:
+  group: appsec-triage-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install package
+        # Installs the appsec-triage console script + the single runtime dep
+        # (httpx). pyproject.toml is the source of truth; requirements.txt is
+        # kept for ad-hoc local installs but the CI path uses the package.
+        run: pip install .
+
+      # NOTE on tokens. The default GITHUB_TOKEN works for issues:write and
+      # the Dependabot alerts list. For dismiss (PATCH .../dependabot/alerts/{n})
+      # the workflow needs security-events:write — already declared in
+      # `permissions:` above. If you ever target a DIFFERENT repo than the one
+      # the workflow lives in, the default token will not cross repo boundaries;
+      # provide a fine-grained PAT in the `APPSEC_TRIAGE_TOKEN` secret with
+      # `dependabot_alerts:write` + `issues:write` for the cross-repo case.
+      - name: Run triage cycle
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY:  ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL:    ${{ secrets.LLM_MODEL }}
+          GITHUB_TOKEN: ${{ secrets.APPSEC_TRIAGE_TOKEN || github.token }}
+          TARGET_REPO:  ${{ inputs.repo || github.repository }}
+        run: |
+          set -euo pipefail
+          ARGS=( --repo "$TARGET_REPO" )
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=( --dry-run )
+          fi
+          if [ "${{ inputs.auto_transition }}" = "true" ]; then
+            ARGS+=( --auto-transition )
+          fi
+          appsec-triage "${ARGS[@]}"
+
+      # `.triage_history.jsonl` does not survive between CI runs by default —
+      # the runner is ephemeral. For PoC we upload the file as an artifact so
+      # it can be inspected. For production, persist it to S3, a private gist,
+      # or a dedicated state repository so the Consistency Gate and the
+      # org-wide consensus check see the full history.
+      - name: Upload triage history (audit + state for PoC)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-history-${{ github.run_id }}
+          path: .triage_history.jsonl
+          if-no-files-found: ignore
+          retention-days: 90

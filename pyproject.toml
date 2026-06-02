@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "appsec-triage"
+version = "0.1.0"
+description = "Multi-agent defensive triage of Dependabot alerts. GitHub-native, single runtime dep (httpx)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["appsec", "dependabot", "github", "triage", "security", "vulnerability"]
+authors = [
+    { name = "AppSec Triage" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+# Single runtime dependency by spec. The LLM is reached via httpx, the GitHub
+# API is reached via httpx. Anything else (yaml, requests, openai sdk, etc.)
+# is a no.
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Local dev only. Not pulled by `pip install appsec-triage`. Opt in with
+# `pip install -e ".[dev]"`.
+dev = [
+    "pytest>=7",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+# `appsec-triage --offline` after `pip install .`. The legacy
+# `python triage_cycle.py` entry point keeps working too — that file is a
+# thin shim that calls `triage.cli:main`.
+appsec-triage = "triage.cli:main"
+
+# ---- setuptools-specific config -------------------------------------------
+
+[tool.setuptools.packages.find]
+# Only ship the `triage/` package. `triage_cycle.py` is a top-level script
+# kept for compat with the spec wording (`python triage_cycle.py …`) — it is
+# NOT installed as an importable module, on purpose: nobody should write
+# `import triage_cycle`.
+include = ["triage*"]
+exclude = ["fixtures*", "tests*"]
+
+[tool.setuptools.package-data]
+# Nothing to bundle inside the package itself for v1. Fixtures live at the
+# repository root for the offline demo, not as installable resources.
+"triage" = []

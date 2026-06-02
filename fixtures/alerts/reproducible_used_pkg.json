@@ -1,0 +1,43 @@
+{
+  "number": 202,
+  "state": "open",
+  "dependency": {
+    "package": {"ecosystem": "pip", "name": "requests"},
+    "manifest_path": "requirements.txt",
+    "scope": "runtime"
+  },
+  "security_advisory": {
+    "ghsa_id": "GHSA-j8r2-6x86-q33q",
+    "cve_id": "CVE-2023-32681",
+    "summary": "Unintended leak of Proxy-Authorization header in requests",
+    "description": "Since requests 2.3.0, the library has been leaking Proxy-Authorization headers to destination servers during redirects to an HTTPS endpoint. Affects requests.Session and the top-level helpers requests.get, requests.post, requests.put, requests.delete when proxies are configured via the proxies argument or the HTTPS_PROXY environment variable.",
+    "severity": "medium"
+  },
+  "security_vulnerability": {
+    "package": {"ecosystem": "pip", "name": "requests"},
+    "vulnerable_version_range": ">= 2.3.0, < 2.31.0",
+    "first_patched_version": {"identifier": "2.31.0"}
+  },
+  "created_at": "2024-08-15T09:30:00Z",
+  "html_url": "https://github.com/example-org/active-service/security/dependabot/202",
+  "_meta": {
+    "expected_verdict": "reproducible",
+    "expected_reason": "package directly used (requests.Session, requests.get); repo active and tier 2 — reaches the Final Judge",
+    "repo_profile_hint": {
+      "owner": "example-org",
+      "name": "active-service",
+      "archived": false,
+      "language": "Python",
+      "age_days": 600,
+      "tier": 2
+    },
+    "code_search_hint": {
+      "direct_package_hits": 12,
+      "vuln_api_hits": 3,
+      "vuln_apis_seen": ["requests.Session", "requests.get"],
+      "has_manifest": true,
+      "has_lockfile": true,
+      "has_dockerfile": true
+    }
+  }
+}
